@@ -1452,7 +1452,7 @@ impl Tty {
 
     #[cfg(feature = "xdp-gnome-screencast")]
     pub fn primary_gbm_device(&self) -> Option<GbmDevice<DrmDeviceFd>> {
-        self.devices.get(&self.primary_node).map(|d| d.gbm.clone())
+        self.devices.get(&self.primary_node).or_else(|| self.devices.values().next()).map(|d| d.gbm.clone())
     }
 
     pub fn set_monitors_active(&mut self, active: bool) {
