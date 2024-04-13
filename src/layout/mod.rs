@@ -36,9 +36,11 @@ use std::time::Duration;
 
 use niri_config::{CenterFocusedColumn, Config, Struts};
 use niri_ipc::SizeChange;
-use smithay::backend::renderer::element::solid::SolidColorRenderElement;
+use smithay::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRenderElement};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::texture::TextureBuffer;
 use smithay::backend::renderer::element::Id;
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Scale, Size, Transform};
@@ -48,20 +50,36 @@ pub use self::monitor::MonitorRenderElement;
 use self::workspace::{compute_working_area, Column, ColumnWidth, OutputId, Workspace};
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
-use crate::render_helpers::RenderTarget;
+use crate::render_helpers::{BakedBuffer, RenderSnapshot, RenderTarget};
 use crate::utils::output_size;
 use crate::window::ResolvedWindowRules;
 
+pub mod closing_window;
 pub mod focus_ring;
 pub mod monitor;
 pub mod tile;
 pub mod workspace;
+
+/// Size changes up to this many pixels don't animate.
+pub const RESIZE_ANIMATION_THRESHOLD: i32 = 10;
 
 niri_render_elements! {
     LayoutElementRenderElement<R> => {
         Wayland = WaylandSurfaceRenderElement<R>,
         SolidColor = SolidColorRenderElement,
     }
+}
+
+pub type LayoutElementRenderSnapshot =
+    RenderSnapshot<BakedBuffer<TextureBuffer<GlesTexture>>, BakedBuffer<SolidColorBuffer>>;
+
+/// Snapshot of an element for animation.
+#[derive(Debug)]
+pub struct AnimationSnapshot {
+    /// Snapshot of the render.
+    pub render: LayoutElementRenderSnapshot,
+    /// Visual size of the element at the point of the snapshot.
+    pub size: Size<i32, Logical>,
 }
 
 pub trait LayoutElement {
@@ -100,7 +118,9 @@ pub trait LayoutElement {
         target: RenderTarget,
     ) -> Vec<LayoutElementRenderElement<R>>;
 
-    fn request_size(&self, size: Size<i32, Logical>);
+    fn take_last_render(&self) -> LayoutElementRenderSnapshot;
+
+    fn request_size(&mut self, size: Size<i32, Logical>, animate: bool);
     fn request_fullscreen(&self, size: Size<i32, Logical>);
     fn min_size(&self) -> Size<i32, Logical>;
     fn max_size(&self) -> Size<i32, Logical>;
@@ -113,7 +133,7 @@ pub trait LayoutElement {
     fn set_activated(&mut self, active: bool);
     fn set_bounds(&self, bounds: Size<i32, Logical>);
 
-    fn send_pending_configure(&self);
+    fn send_pending_configure(&mut self);
 
     /// Whether the element is currently fullscreen.
     ///
@@ -129,6 +149,9 @@ pub trait LayoutElement {
 
     /// Runs periodic clean-up tasks.
     fn refresh(&self);
+
+    fn animation_snapshot(&self) -> Option<&AnimationSnapshot>;
+    fn take_animation_snapshot(&mut self) -> Option<AnimationSnapshot>;
 }
 
 #[derive(Debug)]
@@ -1700,10 +1723,22 @@ impl<W: LayoutElement> Layout<W> {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
                     for ws in &mut mon.workspaces {
-                        for col in &mut ws.columns {
+                        for (col_idx, col) in ws.columns.iter_mut().enumerate() {
                             for tile in &mut col.tiles {
                                 if tile.window().id() == window {
                                     tile.start_open_animation();
+
+                                    let offset = ws.column_x(col_idx + 1) - ws.column_x(col_idx);
+                                    if ws.active_column_idx <= col_idx {
+                                        for col in &mut ws.columns[col_idx + 1..] {
+                                            col.animate_move_from(-offset);
+                                        }
+                                    } else {
+                                        for col in &mut ws.columns[..col_idx] {
+                                            col.animate_move_from(offset);
+                                        }
+                                    }
+
                                     return;
                                 }
                             }
@@ -1713,13 +1748,79 @@ impl<W: LayoutElement> Layout<W> {
             }
             MonitorSet::NoOutputs { workspaces, .. } => {
                 for ws in workspaces {
-                    for col in &mut ws.columns {
+                    for (col_idx, col) in ws.columns.iter_mut().enumerate() {
                         for tile in &mut col.tiles {
                             if tile.window().id() == window {
                                 tile.start_open_animation();
+
+                                let offset = ws.column_x(col_idx + 1) - ws.column_x(col_idx);
+                                if ws.active_column_idx <= col_idx {
+                                    for col in &mut ws.columns[col_idx + 1..] {
+                                        col.animate_move_from(-offset);
+                                    }
+                                } else {
+                                    for col in &mut ws.columns[..col_idx] {
+                                        col.animate_move_from(offset);
+                                    }
+                                }
+
                                 return;
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn start_close_animation_for_window(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        window: &W::Id,
+    ) {
+        let _span = tracy_client::span!("Layout::start_close_animation_for_window");
+
+        match &mut self.monitor_set {
+            MonitorSet::Normal { monitors, .. } => {
+                for mon in monitors {
+                    for ws in &mut mon.workspaces {
+                        if ws.has_window(window) {
+                            ws.start_close_animation_for_window(renderer, window);
+                            return;
+                        }
+                    }
+                }
+            }
+            MonitorSet::NoOutputs { workspaces, .. } => {
+                for ws in workspaces {
+                    if ws.has_window(window) {
+                        ws.start_close_animation_for_window(renderer, window);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn prepare_for_resize_animation(&mut self, window: &W::Id) {
+        let _span = tracy_client::span!("Layout::prepare_for_resize_animation");
+
+        match &mut self.monitor_set {
+            MonitorSet::Normal { monitors, .. } => {
+                for mon in monitors {
+                    for ws in &mut mon.workspaces {
+                        if ws.has_window(window) {
+                            ws.prepare_for_resize_animation(window);
+                            return;
+                        }
+                    }
+                }
+            }
+            MonitorSet::NoOutputs { workspaces, .. } => {
+                for ws in workspaces {
+                    if ws.has_window(window) {
+                        ws.prepare_for_resize_animation(window);
+                        return;
                     }
                 }
             }
@@ -1865,7 +1966,11 @@ mod tests {
             vec![]
         }
 
-        fn request_size(&self, size: Size<i32, Logical>) {
+        fn take_last_render(&self) -> LayoutElementRenderSnapshot {
+            RenderSnapshot::default()
+        }
+
+        fn request_size(&mut self, size: Size<i32, Logical>, _animate: bool) {
             self.0.requested_size.set(Some(size));
             self.0.pending_fullscreen.set(false);
         }
@@ -1902,7 +2007,7 @@ mod tests {
 
         fn set_bounds(&self, _bounds: Size<i32, Logical>) {}
 
-        fn send_pending_configure(&self) {}
+        fn send_pending_configure(&mut self) {}
 
         fn is_fullscreen(&self) -> bool {
             false
@@ -1917,6 +2022,14 @@ mod tests {
         fn rules(&self) -> &ResolvedWindowRules {
             static EMPTY: ResolvedWindowRules = ResolvedWindowRules::empty();
             &EMPTY
+        }
+
+        fn animation_snapshot(&self) -> Option<&AnimationSnapshot> {
+            None
+        }
+
+        fn take_animation_snapshot(&mut self) -> Option<AnimationSnapshot> {
+            None
         }
     }
 

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use keyframe::functions::EaseOutCubic;
+use keyframe::functions::{EaseOutCubic, EaseOutQuad};
 use keyframe::EasingFunction;
 use portable_atomic::{AtomicF64, Ordering};
 
@@ -16,6 +16,10 @@ pub struct Animation {
     from: f64,
     to: f64,
     duration: Duration,
+    /// Time until the animation first reaches `to`.
+    ///
+    /// Best effort; not always exactly precise.
+    clamped_duration: Duration,
     start_time: Duration,
     current_time: Duration,
     kind: Kind,
@@ -35,6 +39,7 @@ enum Kind {
 
 #[derive(Debug, Clone, Copy)]
 pub enum Curve {
+    EaseOutQuad,
     EaseOutCubic,
     EaseOutExpo,
 }
@@ -105,6 +110,8 @@ impl Animation {
             from,
             to,
             duration,
+            // Our current curves never overshoot.
+            clamped_duration: duration,
             start_time: now,
             current_time: now,
             kind,
@@ -112,17 +119,21 @@ impl Animation {
     }
 
     pub fn spring(spring: Spring) -> Self {
+        let _span = tracy_client::span!("Animation::spring");
+
         // FIXME: ideally we shouldn't use current time here because animations started within the
         // same frame cycle should have the same start time to be synchronized.
         let now = get_monotonic_time();
 
         let duration = spring.duration();
+        let clamped_duration = spring.clamped_duration().unwrap_or(duration);
         let kind = Kind::Spring(spring);
 
         Self {
             from: spring.from,
             to: spring.to,
             duration,
+            clamped_duration,
             start_time: now,
             current_time: now,
             kind,
@@ -158,6 +169,7 @@ impl Animation {
             from,
             to,
             duration,
+            clamped_duration: duration,
             start_time: now,
             current_time: now,
             kind,
@@ -227,6 +239,10 @@ impl Animation {
         self.current_time >= self.start_time + self.duration
     }
 
+    pub fn is_clamped_done(&self) -> bool {
+        self.current_time >= self.start_time + self.clamped_duration
+    }
+
     pub fn value(&self) -> f64 {
         if self.is_done() {
             return self.to;
@@ -253,6 +269,17 @@ impl Animation {
         }
     }
 
+    /// Returns a value that stops at the target value after first reaching it.
+    ///
+    /// Best effort; not always exactly precise.
+    pub fn clamped_value(&self) -> f64 {
+        if self.is_clamped_done() {
+            return self.to;
+        }
+
+        self.value()
+    }
+
     pub fn to(&self) -> f64 {
         self.to
     }
@@ -261,11 +288,22 @@ impl Animation {
     pub fn from(&self) -> f64 {
         self.from
     }
+
+    pub fn offset(&mut self, offset: f64) {
+        self.from += offset;
+        self.to += offset;
+
+        if let Kind::Spring(spring) = &mut self.kind {
+            spring.from += offset;
+            spring.to += offset;
+        }
+    }
 }
 
 impl Curve {
     pub fn y(self, x: f64) -> f64 {
         match self {
+            Curve::EaseOutQuad => EaseOutQuad.y(x),
             Curve::EaseOutCubic => EaseOutCubic.y(x),
             Curve::EaseOutExpo => 1. - 2f64.powf(-10. * x),
         }
@@ -275,6 +313,7 @@ impl Curve {
 impl From<niri_config::AnimationCurve> for Curve {
     fn from(value: niri_config::AnimationCurve) -> Self {
         match value {
+            niri_config::AnimationCurve::EaseOutQuad => Curve::EaseOutQuad,
             niri_config::AnimationCurve::EaseOutCubic => Curve::EaseOutCubic,
             niri_config::AnimationCurve::EaseOutExpo => Curve::EaseOutExpo,
         }

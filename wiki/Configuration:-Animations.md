@@ -24,9 +24,22 @@ animations {
         spring damping-ratio=1.0 stiffness=800 epsilon=0.0001
     }
 
+    window-movement {
+        spring damping-ratio=1.0 stiffness=800 epsilon=0.0001
+    }
+
     window-open {
         duration-ms 150
         curve "ease-out-expo"
+    }
+
+    window-close {
+        duration-ms 150
+        curve "ease-out-quad"
+    }
+
+    window-resize {
+        spring damping-ratio=1.0 stiffness=800 epsilon=0.0001
     }
 
     config-notification-open-close {
@@ -58,7 +71,12 @@ animations {
 }
 ```
 
-Currently, niri only supports two curves: `ease-out-cubic` and `ease-out-expo`.
+Currently, niri only supports three curves:
+
+- `ease-out-quad` <sup>Since: 0.1.5</sup>
+- `ease-out-cubic`
+- `ease-out-expo`
+
 You can get a feel for them on pages like [easings.net](https://easings.net/).
 
 #### Spring
@@ -131,6 +149,25 @@ animations {
 }
 ```
 
+#### `window-movement`
+
+<sup>Since: 0.1.5</sup>
+
+Window movement animations, currently cover only horizontal column movement.
+
+This animation runs on actions like `move-column-left` and `move-column-right` to move the windows themselves.
+It can sometimes run together with the `horizontal-view-movement` animation, if the camera also moves.
+
+Since 0.1.5, this is also the animation that moves windows out of the way upon window opening and closing.
+
+```
+animations {
+    window-movement {
+        spring damping-ratio=1.0 stiffness=800 epsilon=0.0001
+    }
+}
+```
+
 #### `window-open`
 
 Window opening animation.
@@ -142,6 +179,40 @@ animations {
     window-open {
         duration-ms 150
         curve "ease-out-expo"
+    }
+}
+```
+
+#### `window-close`
+
+<sup>Since: 0.1.5</sup>
+
+Window closing animation.
+
+This one uses an easing type by default.
+
+```
+animations {
+    window-open {
+        duration-ms 150
+        curve "ease-out-quad"
+    }
+}
+```
+
+#### `window-resize`
+
+<sup>Since: 0.1.5</sup>
+
+Window resize animation.
+
+Only manual window resizes are animated, i.e. when you resize the window with `switch-preset-column-width` or `maximize-column`.
+Also, very small resizes (up to 10 pixels) are not animated.
+
+```
+animations {
+    window-resize {
+        spring damping-ratio=1.0 stiffness=800 epsilon=0.0001
     }
 }
 ```
