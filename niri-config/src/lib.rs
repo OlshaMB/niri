@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use bitflags::bitflags;
 use knuffel::errors::DecodeError;
+use knuffel::Decode as _;
 use miette::{miette, Context, IntoDiagnostic, NarratableReportHandler};
 use niri_ipc::{LayoutSwitchTarget, SizeChange, Transform};
 use regex::Regex;
@@ -250,6 +251,8 @@ pub struct Output {
     pub position: Option<Position>,
     #[knuffel(child, unwrap(argument, str))]
     pub mode: Option<Mode>,
+    #[knuffel(child)]
+    pub variable_refresh_rate: bool,
 }
 
 impl Default for Output {
@@ -261,6 +264,7 @@ impl Default for Output {
             transform: Transform::Normal,
             position: None,
             mode: None,
+            variable_refresh_rate: false,
         }
     }
 }
@@ -408,6 +412,19 @@ impl From<Border> for FocusRing {
     }
 }
 
+impl From<FocusRing> for Border {
+    fn from(value: FocusRing) -> Self {
+        Self {
+            off: value.off,
+            width: value.width,
+            active_color: value.active_color,
+            inactive_color: value.inactive_color,
+            active_gradient: value.active_gradient,
+            inactive_gradient: value.inactive_gradient,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Color {
     pub r: u8,
@@ -473,26 +490,26 @@ pub struct HotkeyOverlay {
     pub skip_at_startup: bool,
 }
 
-#[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
+#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub struct Animations {
     #[knuffel(child)]
     pub off: bool,
     #[knuffel(child, unwrap(argument), default = 1.)]
     pub slowdown: f64,
-    #[knuffel(child, default = Animation::default_workspace_switch())]
-    pub workspace_switch: Animation,
-    #[knuffel(child, default = Animation::default_horizontal_view_movement())]
-    pub horizontal_view_movement: Animation,
-    #[knuffel(child, default = Animation::default_window_movement())]
-    pub window_movement: Animation,
-    #[knuffel(child, default = Animation::default_window_open())]
-    pub window_open: Animation,
-    #[knuffel(child, default = Animation::default_window_close())]
-    pub window_close: Animation,
-    #[knuffel(child, default = Animation::default_window_resize())]
-    pub window_resize: Animation,
-    #[knuffel(child, default = Animation::default_config_notification_open_close())]
-    pub config_notification_open_close: Animation,
+    #[knuffel(child, default)]
+    pub workspace_switch: WorkspaceSwitchAnim,
+    #[knuffel(child, default)]
+    pub window_open: WindowOpenAnim,
+    #[knuffel(child, default)]
+    pub window_close: WindowCloseAnim,
+    #[knuffel(child, default)]
+    pub horizontal_view_movement: HorizontalViewMovementAnim,
+    #[knuffel(child, default)]
+    pub window_movement: WindowMovementAnim,
+    #[knuffel(child, default)]
+    pub window_resize: WindowResizeAnim,
+    #[knuffel(child, default)]
+    pub config_notification_open_close: ConfigNotificationOpenCloseAnim,
 }
 
 impl Default for Animations {
@@ -500,14 +517,130 @@ impl Default for Animations {
         Self {
             off: false,
             slowdown: 1.,
-            workspace_switch: Animation::default_workspace_switch(),
-            horizontal_view_movement: Animation::default_horizontal_view_movement(),
-            window_movement: Animation::default_window_movement(),
-            window_open: Animation::default_window_open(),
-            window_close: Animation::default_window_close(),
-            window_resize: Animation::default_window_resize(),
-            config_notification_open_close: Animation::default_config_notification_open_close(),
+            workspace_switch: Default::default(),
+            horizontal_view_movement: Default::default(),
+            window_movement: Default::default(),
+            window_open: Default::default(),
+            window_close: Default::default(),
+            window_resize: Default::default(),
+            config_notification_open_close: Default::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorkspaceSwitchAnim(pub Animation);
+
+impl Default for WorkspaceSwitchAnim {
+    fn default() -> Self {
+        Self(Animation {
+            off: false,
+            kind: AnimationKind::Spring(SpringParams {
+                damping_ratio: 1.,
+                stiffness: 1000,
+                epsilon: 0.0001,
+            }),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowOpenAnim(pub Animation);
+
+impl Default for WindowOpenAnim {
+    fn default() -> Self {
+        Self(Animation {
+            off: false,
+            kind: AnimationKind::Easing(EasingParams {
+                duration_ms: 150,
+                curve: AnimationCurve::EaseOutExpo,
+            }),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowCloseAnim(pub Animation);
+
+impl Default for WindowCloseAnim {
+    fn default() -> Self {
+        Self(Animation {
+            off: false,
+            kind: AnimationKind::Easing(EasingParams {
+                duration_ms: 150,
+                curve: AnimationCurve::EaseOutQuad,
+            }),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HorizontalViewMovementAnim(pub Animation);
+
+impl Default for HorizontalViewMovementAnim {
+    fn default() -> Self {
+        Self(Animation {
+            off: false,
+            kind: AnimationKind::Spring(SpringParams {
+                damping_ratio: 1.,
+                stiffness: 800,
+                epsilon: 0.0001,
+            }),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowMovementAnim(pub Animation);
+
+impl Default for WindowMovementAnim {
+    fn default() -> Self {
+        Self(Animation {
+            off: false,
+            kind: AnimationKind::Spring(SpringParams {
+                damping_ratio: 1.,
+                stiffness: 800,
+                epsilon: 0.0001,
+            }),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowResizeAnim {
+    pub anim: Animation,
+    pub custom_shader: Option<String>,
+}
+
+impl Default for WindowResizeAnim {
+    fn default() -> Self {
+        Self {
+            anim: Animation {
+                off: false,
+                kind: AnimationKind::Spring(SpringParams {
+                    damping_ratio: 1.,
+                    stiffness: 800,
+                    epsilon: 0.0001,
+                }),
+            },
+            custom_shader: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConfigNotificationOpenCloseAnim(pub Animation);
+
+impl Default for ConfigNotificationOpenCloseAnim {
+    fn default() -> Self {
+        Self(Animation {
+            off: false,
+            kind: AnimationKind::Spring(SpringParams {
+                damping_ratio: 0.6,
+                stiffness: 1000,
+                epsilon: 0.001,
+            }),
+        })
     }
 }
 
@@ -515,97 +648,6 @@ impl Default for Animations {
 pub struct Animation {
     pub off: bool,
     pub kind: AnimationKind,
-}
-
-impl Animation {
-    pub const fn unfilled() -> Self {
-        Self {
-            off: false,
-            kind: AnimationKind::Easing(EasingParams::unfilled()),
-        }
-    }
-
-    pub const fn default() -> Self {
-        Self {
-            off: false,
-            kind: AnimationKind::Easing(EasingParams::default()),
-        }
-    }
-
-    pub const fn default_workspace_switch() -> Self {
-        Self {
-            off: false,
-            kind: AnimationKind::Spring(SpringParams {
-                damping_ratio: 1.,
-                stiffness: 1000,
-                epsilon: 0.0001,
-            }),
-        }
-    }
-
-    pub const fn default_horizontal_view_movement() -> Self {
-        Self {
-            off: false,
-            kind: AnimationKind::Spring(SpringParams {
-                damping_ratio: 1.,
-                stiffness: 800,
-                epsilon: 0.0001,
-            }),
-        }
-    }
-
-    pub const fn default_window_movement() -> Self {
-        Self {
-            off: false,
-            kind: AnimationKind::Spring(SpringParams {
-                damping_ratio: 1.,
-                stiffness: 800,
-                epsilon: 0.0001,
-            }),
-        }
-    }
-
-    pub const fn default_config_notification_open_close() -> Self {
-        Self {
-            off: false,
-            kind: AnimationKind::Spring(SpringParams {
-                damping_ratio: 0.6,
-                stiffness: 1000,
-                epsilon: 0.001,
-            }),
-        }
-    }
-
-    pub const fn default_window_open() -> Self {
-        Self {
-            off: false,
-            kind: AnimationKind::Easing(EasingParams {
-                duration_ms: Some(150),
-                curve: Some(AnimationCurve::EaseOutExpo),
-            }),
-        }
-    }
-
-    pub const fn default_window_close() -> Self {
-        Self {
-            off: false,
-            kind: AnimationKind::Easing(EasingParams {
-                duration_ms: Some(150),
-                curve: Some(AnimationCurve::EaseOutQuad),
-            }),
-        }
-    }
-
-    pub const fn default_window_resize() -> Self {
-        Self {
-            off: false,
-            kind: AnimationKind::Spring(SpringParams {
-                damping_ratio: 1.,
-                stiffness: 800,
-                epsilon: 0.0001,
-            }),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -616,24 +658,8 @@ pub enum AnimationKind {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EasingParams {
-    pub duration_ms: Option<u32>,
-    pub curve: Option<AnimationCurve>,
-}
-
-impl EasingParams {
-    pub const fn unfilled() -> Self {
-        Self {
-            duration_ms: None,
-            curve: None,
-        }
-    }
-
-    pub const fn default() -> Self {
-        Self {
-            duration_ms: Some(250),
-            curve: Some(AnimationCurve::EaseOutCubic),
-        }
-    }
+    pub duration_ms: u32,
+    pub curve: AnimationCurve,
 }
 
 #[derive(knuffel::DecodeScalar, Debug, Clone, Copy, PartialEq)]
@@ -688,6 +714,10 @@ pub struct WindowRule {
     #[knuffel(child, unwrap(argument))]
     pub max_height: Option<u16>,
 
+    #[knuffel(child, default)]
+    pub focus_ring: BorderRule,
+    #[knuffel(child, default)]
+    pub border: BorderRule,
     #[knuffel(child, unwrap(argument))]
     pub draw_border_with_background: Option<bool>,
     #[knuffel(child, unwrap(argument))]
@@ -724,6 +754,24 @@ pub enum BlockOutFrom {
     ScreenCapture,
 }
 
+#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
+pub struct BorderRule {
+    #[knuffel(child)]
+    pub off: bool,
+    #[knuffel(child)]
+    pub on: bool,
+    #[knuffel(child, unwrap(argument))]
+    pub width: Option<u16>,
+    #[knuffel(child)]
+    pub active_color: Option<Color>,
+    #[knuffel(child)]
+    pub inactive_color: Option<Color>,
+    #[knuffel(child)]
+    pub active_gradient: Option<Gradient>,
+    #[knuffel(child)]
+    pub inactive_gradient: Option<Gradient>,
+}
+
 #[derive(Debug, Default, PartialEq)]
 pub struct Binds(pub Vec<Bind>);
 
@@ -732,6 +780,7 @@ pub struct Bind {
     pub key: Key,
     pub action: Action,
     pub cooldown: Option<Duration>,
+    pub allow_when_locked: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
@@ -928,6 +977,8 @@ pub struct DebugConfig {
     pub enable_overlay_planes: bool,
     #[knuffel(child)]
     pub disable_cursor_plane: bool,
+    #[knuffel(child)]
+    pub disable_direct_scanout: bool,
     #[knuffel(child, unwrap(argument))]
     pub render_drm_device: Option<PathBuf>,
     #[knuffel(child)]
@@ -975,6 +1026,56 @@ impl Default for Config {
             include_str!("../../resources/default-config.kdl"),
         )
         .unwrap()
+    }
+}
+
+impl BorderRule {
+    pub fn merge_with(&mut self, other: &Self) {
+        self.off |= other.off;
+        self.on |= other.on;
+
+        if let Some(x) = other.width {
+            self.width = Some(x);
+        }
+        if let Some(x) = other.active_color {
+            self.active_color = Some(x);
+        }
+        if let Some(x) = other.inactive_color {
+            self.inactive_color = Some(x);
+        }
+        if let Some(x) = other.active_gradient {
+            self.active_gradient = Some(x);
+        }
+        if let Some(x) = other.inactive_gradient {
+            self.inactive_gradient = Some(x);
+        }
+    }
+
+    pub fn resolve_against(&self, mut config: Border) -> Border {
+        config.off |= self.off;
+        if self.on {
+            config.off = false;
+        }
+
+        if let Some(x) = self.width {
+            config.width = x;
+        }
+        if let Some(x) = self.active_color {
+            config.active_color = x;
+            config.active_gradient = None;
+        }
+        if let Some(x) = self.inactive_color {
+            config.inactive_color = x;
+            config.inactive_gradient = None;
+        }
+        if let Some(x) = self.active_gradient {
+            config.active_gradient = Some(x);
+        }
+        if let Some(x) = self.inactive_gradient {
+            config.inactive_gradient = Some(x);
+        }
+
+        config
     }
 }
 
@@ -1174,7 +1275,7 @@ fn parse_arg_node<S: knuffel::traits::ErrorSpan, T: knuffel::traits::DecodeScala
     Ok(value)
 }
 
-impl<S> knuffel::Decode<S> for Animation
+impl<S> knuffel::Decode<S> for WorkspaceSwitchAnim
 where
     S: knuffel::traits::ErrorSpan,
 {
@@ -1182,10 +1283,134 @@ where
         node: &knuffel::ast::SpannedNode<S>,
         ctx: &mut knuffel::decode::Context<S>,
     ) -> Result<Self, DecodeError<S>> {
+        let default = Self::default().0;
+        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
+            Ok(false)
+        })?))
+    }
+}
+
+impl<S> knuffel::Decode<S> for HorizontalViewMovementAnim
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let default = Self::default().0;
+        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
+            Ok(false)
+        })?))
+    }
+}
+
+impl<S> knuffel::Decode<S> for WindowMovementAnim
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let default = Self::default().0;
+        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
+            Ok(false)
+        })?))
+    }
+}
+
+impl<S> knuffel::Decode<S> for WindowOpenAnim
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let default = Self::default().0;
+        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
+            Ok(false)
+        })?))
+    }
+}
+
+impl<S> knuffel::Decode<S> for WindowCloseAnim
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let default = Self::default().0;
+        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
+            Ok(false)
+        })?))
+    }
+}
+
+impl<S> knuffel::Decode<S> for WindowResizeAnim
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let default = Self::default().anim;
+        let mut custom_shader = None;
+        let anim = Animation::decode_node(node, ctx, default, |child, ctx| {
+            if &**child.node_name == "custom-shader" {
+                custom_shader = parse_arg_node("custom-shader", child, ctx)?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })?;
+
+        Ok(Self {
+            anim,
+            custom_shader,
+        })
+    }
+}
+
+impl<S> knuffel::Decode<S> for ConfigNotificationOpenCloseAnim
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let default = Self::default().0;
+        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
+            Ok(false)
+        })?))
+    }
+}
+
+impl Animation {
+    fn decode_node<S: knuffel::traits::ErrorSpan>(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+        default: Self,
+        mut process_children: impl FnMut(
+            &knuffel::ast::SpannedNode<S>,
+            &mut knuffel::decode::Context<S>,
+        ) -> Result<bool, DecodeError<S>>,
+    ) -> Result<Self, DecodeError<S>> {
+        #[derive(Default, PartialEq)]
+        struct OptionalEasingParams {
+            duration_ms: Option<u32>,
+            curve: Option<AnimationCurve>,
+        }
+
         expect_only_children(node, ctx);
 
         let mut off = false;
-        let mut easing_params = EasingParams::unfilled();
+        let mut easing_params = OptionalEasingParams::default();
         let mut spring_params = None;
 
         for child in node.children() {
@@ -1203,7 +1428,7 @@ where
                     }
                 }
                 "spring" => {
-                    if easing_params != EasingParams::unfilled() {
+                    if easing_params != OptionalEasingParams::default() {
                         ctx.emit_error(DecodeError::unexpected(
                             child,
                             "node",
@@ -1257,19 +1482,40 @@ where
                     easing_params.curve = Some(parse_arg_node("curve", child, ctx)?);
                 }
                 name_str => {
-                    ctx.emit_error(DecodeError::unexpected(
-                        child,
-                        "node",
-                        format!("unexpected node `{}`", name_str.escape_default()),
-                    ));
+                    if !process_children(child, ctx)? {
+                        ctx.emit_error(DecodeError::unexpected(
+                            child,
+                            "node",
+                            format!("unexpected node `{}`", name_str.escape_default()),
+                        ));
+                    }
                 }
             }
         }
 
         let kind = if let Some(spring_params) = spring_params {
+            // Configured spring.
             AnimationKind::Spring(spring_params)
+        } else if easing_params == OptionalEasingParams::default() {
+            // Did not configure anything.
+            default.kind
         } else {
-            AnimationKind::Easing(easing_params)
+            // Configured easing.
+            let default = if let AnimationKind::Easing(easing) = default.kind {
+                easing
+            } else {
+                // Generic fallback values for when the default animation is spring, but the user
+                // configured an easing animation.
+                EasingParams {
+                    duration_ms: 250,
+                    curve: AnimationCurve::EaseOutCubic,
+                }
+            };
+
+            AnimationKind::Easing(EasingParams {
+                duration_ms: easing_params.duration_ms.unwrap_or(default.duration_ms),
+                curve: easing_params.curve.unwrap_or(default.curve),
+            })
         };
 
         Ok(Self { off, kind })
@@ -1443,7 +1689,7 @@ where
                 &val.literal,
                 "argument",
                 "no arguments expected for this node",
-            ))
+            ));
         }
 
         let key = node
@@ -1452,12 +1698,18 @@ where
             .map_err(|e| DecodeError::conversion(&node.node_name, e.wrap_err("invalid keybind")))?;
 
         let mut cooldown = None;
+        let mut allow_when_locked = false;
+        let mut allow_when_locked_node = None;
         for (name, val) in &node.properties {
             match &***name {
                 "cooldown-ms" => {
                     cooldown = Some(Duration::from_millis(
                         knuffel::traits::DecodeScalar::decode(val, ctx)?,
                     ));
+                }
+                "allow-when-locked" => {
+                    allow_when_locked = knuffel::traits::DecodeScalar::decode(val, ctx)?;
+                    allow_when_locked_node = Some(name);
                 }
                 name_str => {
                     ctx.emit_error(DecodeError::unexpected(
@@ -1478,6 +1730,7 @@ where
             key,
             action: Action::Spawn(vec![]),
             cooldown: None,
+            allow_when_locked: false,
         };
 
         if let Some(child) = children.next() {
@@ -1489,11 +1742,24 @@ where
                 ));
             }
             match Action::decode_node(child, ctx) {
-                Ok(action) => Ok(Self {
-                    key,
-                    action,
-                    cooldown,
-                }),
+                Ok(action) => {
+                    if !matches!(action, Action::Spawn(_)) {
+                        if let Some(node) = allow_when_locked_node {
+                            ctx.emit_error(DecodeError::unexpected(
+                                node,
+                                "property",
+                                "allow-when-locked can only be set on spawn binds",
+                            ));
+                        }
+                    }
+
+                    Ok(Self {
+                        key,
+                        action,
+                        cooldown,
+                        allow_when_locked,
+                    })
+                }
                 Err(e) => {
                     ctx.emit_error(e);
                     Ok(dummy)
@@ -1719,6 +1985,7 @@ mod tests {
                 transform "flipped-90"
                 position x=10 y=20
                 mode "1920x1080@144"
+                variable-refresh-rate
             }
 
             layout {
@@ -1797,10 +2064,20 @@ mod tests {
                 open-on-output "eDP-1"
                 open-maximized true
                 open-fullscreen false
+
+                focus-ring {
+                    off
+                    width 3
+                }
+
+                border {
+                    on
+                    width 8
+                }
             }
 
             binds {
-                Mod+T { spawn "alacritty"; }
+                Mod+T allow-when-locked=true { spawn "alacritty"; }
                 Mod+Q { close-window; }
                 Mod+Shift+H { focus-monitor-left; }
                 Mod+Ctrl+Shift+L { move-window-to-monitor-right; }
@@ -1868,6 +2145,7 @@ mod tests {
                         height: 1080,
                         refresh: Some(144.),
                     }),
+                    variable_refresh_rate: true,
                 }],
                 layout: Layout {
                     focus_ring: FocusRing {
@@ -1943,25 +2221,25 @@ mod tests {
                 },
                 animations: Animations {
                     slowdown: 2.,
-                    workspace_switch: Animation {
+                    workspace_switch: WorkspaceSwitchAnim(Animation {
                         off: false,
                         kind: AnimationKind::Spring(SpringParams {
                             damping_ratio: 1.,
                             stiffness: 1000,
                             epsilon: 0.0001,
                         }),
-                    },
-                    horizontal_view_movement: Animation {
+                    }),
+                    horizontal_view_movement: HorizontalViewMovementAnim(Animation {
                         off: false,
                         kind: AnimationKind::Easing(EasingParams {
-                            duration_ms: Some(100),
-                            curve: Some(AnimationCurve::EaseOutExpo),
+                            duration_ms: 100,
+                            curve: AnimationCurve::EaseOutExpo,
                         }),
-                    },
-                    window_open: Animation {
+                    }),
+                    window_open: WindowOpenAnim(Animation {
                         off: true,
-                        ..Animation::unfilled()
-                    },
+                        ..WindowOpenAnim::default().0
+                    }),
                     ..Default::default()
                 },
                 environment: Environment(vec![
@@ -1998,6 +2276,16 @@ mod tests {
                     open_on_output: Some("eDP-1".to_owned()),
                     open_maximized: Some(true),
                     open_fullscreen: Some(false),
+                    focus_ring: BorderRule {
+                        off: true,
+                        width: Some(3),
+                        ..Default::default()
+                    },
+                    border: BorderRule {
+                        on: true,
+                        width: Some(8),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 }],
                 binds: Binds(vec![
@@ -2008,6 +2296,7 @@ mod tests {
                         },
                         action: Action::Spawn(vec!["alacritty".to_owned()]),
                         cooldown: None,
+                        allow_when_locked: true,
                     },
                     Bind {
                         key: Key {
@@ -2016,6 +2305,7 @@ mod tests {
                         },
                         action: Action::CloseWindow,
                         cooldown: None,
+                        allow_when_locked: false,
                     },
                     Bind {
                         key: Key {
@@ -2024,6 +2314,7 @@ mod tests {
                         },
                         action: Action::FocusMonitorLeft,
                         cooldown: None,
+                        allow_when_locked: false,
                     },
                     Bind {
                         key: Key {
@@ -2032,6 +2323,7 @@ mod tests {
                         },
                         action: Action::MoveWindowToMonitorRight,
                         cooldown: None,
+                        allow_when_locked: false,
                     },
                     Bind {
                         key: Key {
@@ -2040,6 +2332,7 @@ mod tests {
                         },
                         action: Action::ConsumeWindowIntoColumn,
                         cooldown: None,
+                        allow_when_locked: false,
                     },
                     Bind {
                         key: Key {
@@ -2048,6 +2341,7 @@ mod tests {
                         },
                         action: Action::FocusWorkspace(1),
                         cooldown: None,
+                        allow_when_locked: false,
                     },
                     Bind {
                         key: Key {
@@ -2056,6 +2350,7 @@ mod tests {
                         },
                         action: Action::Quit(true),
                         cooldown: None,
+                        allow_when_locked: false,
                     },
                     Bind {
                         key: Key {
@@ -2064,6 +2359,7 @@ mod tests {
                         },
                         action: Action::FocusWorkspaceDown,
                         cooldown: Some(Duration::from_millis(150)),
+                        allow_when_locked: false,
                     },
                 ]),
                 debug: DebugConfig {

@@ -51,6 +51,7 @@ use smithay::reexports::wayland_protocols_misc::server_decoration as _server_dec
 use smithay::reexports::wayland_server::backend::{
     ClientData, ClientId, DisconnectReason, GlobalId,
 };
+use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle, Resource};
 use smithay::utils::{
@@ -77,7 +78,7 @@ use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::selection::wlr_data_control::DataControlState;
 use smithay::wayland::session_lock::{LockSurface, SessionLockManagerState, SessionLocker};
 use smithay::wayland::shell::kde::decoration::KdeDecorationState;
-use smithay::wayland::shell::wlr_layer::{Layer, WlrLayerShellState};
+use smithay::wayland::shell::wlr_layer::{self, Layer, WlrLayerShellState};
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
@@ -107,12 +108,15 @@ use crate::protocols::gamma_control::GammaControlManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyManagerState};
 use crate::pw_utils::{Cast, PipeWire};
 use crate::render_helpers::renderer::NiriRenderer;
-use crate::render_helpers::{render_to_shm, render_to_texture, render_to_vec, RenderTarget};
+use crate::render_helpers::{
+    render_to_shm, render_to_texture, render_to_vec, shaders, RenderTarget,
+};
 use crate::scroll_tracker::ScrollTracker;
 use crate::ui::config_error_notification::ConfigErrorNotification;
 use crate::ui::exit_confirm_dialog::ExitConfirmDialog;
 use crate::ui::hotkey_overlay::HotkeyOverlay;
 use crate::ui::screenshot_ui::{ScreenshotUi, ScreenshotUiRenderElement};
+use crate::utils::scale::guess_monitor_scale;
 use crate::utils::spawning::CHILD_ENV;
 use crate::utils::{
     center, center_f64, get_monotonic_time, ipc_transform_to_smithay, logical_output,
@@ -698,8 +702,10 @@ impl State {
                     })
             };
             let layer_focus = |surface: &LayerSurface| {
-                surface
-                    .can_receive_keyboard_focus()
+                // FIXME: support on-demand.
+                let can_receive_keyboard_focus = surface.cached_state().keyboard_interactivity
+                    == wlr_layer::KeyboardInteractivity::Exclusive;
+                can_receive_keyboard_focus
                     .then(|| surface.wl_surface().clone())
                     .map(|surface| KeyboardFocus::LayerShell { surface })
             };
@@ -765,7 +771,7 @@ impl State {
                     );
 
                     grab.grab.ungrab(PopupUngrabStrategy::All);
-                    keyboard.unset_grab();
+                    keyboard.unset_grab(self);
                     self.niri.seat.get_pointer().unwrap().unset_grab(
                         self,
                         SERIAL_COUNTER.next_serial(),
@@ -846,6 +852,7 @@ impl State {
         let mut libinput_config_changed = false;
         let mut output_config_changed = false;
         let mut window_rules_changed = false;
+        let mut debug_config_changed = false;
         let mut old_config = self.niri.config.borrow_mut();
 
         // Reload the cursor.
@@ -895,6 +902,19 @@ impl State {
             window_rules_changed = true;
         }
 
+        if config.animations.window_resize.custom_shader
+            != old_config.animations.window_resize.custom_shader
+        {
+            let src = config.animations.window_resize.custom_shader.as_deref();
+            self.backend.with_primary_renderer(|renderer| {
+                shaders::set_custom_resize_program(renderer, src);
+            });
+        }
+
+        if config.debug != old_config.debug {
+            debug_config_changed = true;
+        }
+
         *old_config = config;
 
         // Release the borrow.
@@ -922,7 +942,11 @@ impl State {
                 let config = self.niri.config.borrow_mut();
                 let config = config.outputs.iter().find(|o| o.name == name);
 
-                let scale = config.map(|c| c.scale).unwrap_or(1.);
+                let scale = config.map(|c| c.scale).unwrap_or_else(|| {
+                    let size_mm = output.physical_properties().size;
+                    let resolution = output.current_mode().unwrap().size;
+                    guess_monitor_scale(size_mm, resolution)
+                });
                 let scale = scale.clamp(1., 10.).ceil() as i32;
 
                 let mut transform = config
@@ -957,6 +981,10 @@ impl State {
             if let Some(touch) = self.niri.seat.get_touch() {
                 touch.cancel(self);
             }
+        }
+
+        if debug_config_changed {
+            self.backend.on_debug_config_changed();
         }
 
         if window_rules_changed {
@@ -1168,7 +1196,10 @@ impl Niri {
             SessionLockManagerState::new::<State, _>(&display_handle, |client| {
                 !client.get_data::<ClientState>().unwrap().restricted
             });
-        let shm_state = ShmState::new::<State>(&display_handle, vec![]);
+        let shm_state = ShmState::new::<State>(
+            &display_handle,
+            vec![wl_shm::Format::Xbgr8888, wl_shm::Format::Abgr8888],
+        );
         let output_manager_state =
             OutputManagerState::new_with_xdg_output::<State>(&display_handle);
         let dmabuf_state = DmabufState::new();
@@ -1543,14 +1574,18 @@ impl Niri {
         }
     }
 
-    pub fn add_output(&mut self, output: Output, refresh_interval: Option<Duration>) {
+    pub fn add_output(&mut self, output: Output, refresh_interval: Option<Duration>, vrr: bool) {
         let global = output.create_global::<State>(&self.display_handle);
 
         let name = output.name();
 
         let config = self.config.borrow();
         let c = config.outputs.iter().find(|o| o.name == name);
-        let scale = c.map(|c| c.scale).unwrap_or(1.);
+        let scale = c.map(|c| c.scale).unwrap_or_else(|| {
+            let size_mm = output.physical_properties().size;
+            let resolution = output.current_mode().unwrap().size;
+            guess_monitor_scale(size_mm, resolution)
+        });
         let scale = scale.clamp(1., 10.).ceil() as i32;
         let mut transform = c
             .map(|c| ipc_transform_to_smithay(c.transform))
@@ -1583,7 +1618,7 @@ impl Niri {
             global,
             redraw_state: RedrawState::Idle,
             unfinished_animations_remain: false,
-            frame_clock: FrameClock::new(refresh_interval),
+            frame_clock: FrameClock::new(refresh_interval, vrr),
             last_drm_sequence: None,
             frame_callback_sequence: 0,
             background_buffer: SolidColorBuffer::new(size, CLEAR_COLOR),

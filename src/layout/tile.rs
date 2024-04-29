@@ -1,31 +1,27 @@
-use std::cell::OnceCell;
 use std::cmp::max;
 use std::rc::Rc;
 use std::time::Duration;
 
-use niri_config::BlockOutFrom;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRenderElement};
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::{Element, Kind};
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
-use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
+use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::utils::{Logical, Point, Rectangle, Scale, Size, Transform};
 
 use super::focus_ring::{FocusRing, FocusRingRenderElement};
 use super::{
-    AnimationSnapshot, LayoutElement, LayoutElementRenderElement, Options,
+    LayoutElement, LayoutElementRenderElement, LayoutElementRenderSnapshot, Options,
     RESIZE_ANIMATION_THRESHOLD,
 };
 use crate::animation::Animation;
 use crate::niri_render_elements;
-use crate::render_helpers::crossfade::CrossfadeRenderElement;
 use crate::render_helpers::offscreen::OffscreenRenderElement;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
-use crate::render_helpers::shaders::Shaders;
-use crate::render_helpers::{
-    render_to_encompassing_texture, RenderSnapshot, RenderTarget, ToRenderElement,
-};
+use crate::render_helpers::resize::ResizeRenderElement;
+use crate::render_helpers::snapshot::RenderSnapshot;
+use crate::render_helpers::{render_to_encompassing_texture, RenderTarget, ToRenderElement};
 
 /// Toplevel window with decorations.
 #[derive(Debug)]
@@ -60,11 +56,14 @@ pub struct Tile<W: LayoutElement> {
     /// The animation of the window resizing.
     resize_animation: Option<ResizeAnimation>,
 
-    /// The animation of a tile visually moving.
-    move_animation: Option<MoveAnimation>,
+    /// The animation of a tile visually moving horizontally.
+    move_x_animation: Option<MoveAnimation>,
+
+    /// The animation of a tile visually moving vertically.
+    move_y_animation: Option<MoveAnimation>,
 
     /// Configurable properties of the layout.
-    options: Rc<Options>,
+    pub options: Rc<Options>,
 }
 
 niri_render_elements! {
@@ -73,7 +72,7 @@ niri_render_elements! {
         FocusRing = FocusRingRenderElement,
         SolidColor = SolidColorRenderElement,
         Offscreen = RescaleRenderElement<OffscreenRenderElement>,
-        Crossfade = CrossfadeRenderElement,
+        Resize = ResizeRenderElement,
     }
 }
 
@@ -96,37 +95,47 @@ niri_render_elements! {
 struct ResizeAnimation {
     anim: Animation,
     size_from: Size<i32, Logical>,
-    snapshot: AnimationSnapshot,
-    /// Snapshot rendered into a texture (happens lazily).
-    snapshot_texture: OnceCell<Option<(GlesTexture, Rectangle<i32, Physical>)>>,
-    snapshot_blocked_out_texture: OnceCell<Option<(GlesTexture, Rectangle<i32, Physical>)>>,
+    snapshot: LayoutElementRenderSnapshot,
 }
 
 #[derive(Debug)]
 struct MoveAnimation {
     anim: Animation,
-    from: Point<i32, Logical>,
+    from: i32,
 }
 
 impl<W: LayoutElement> Tile<W> {
     pub fn new(window: W, options: Rc<Options>) -> Self {
+        let rules = window.rules();
+        let border_config = rules.border.resolve_against(options.border);
+        let focus_ring_config = rules.focus_ring.resolve_against(options.focus_ring.into());
+
         Self {
             window,
-            border: FocusRing::new(options.border.into()),
-            focus_ring: FocusRing::new(options.focus_ring),
+            border: FocusRing::new(border_config.into()),
+            focus_ring: FocusRing::new(focus_ring_config.into()),
             is_fullscreen: false, // FIXME: up-to-date fullscreen right away, but we need size.
             fullscreen_backdrop: SolidColorBuffer::new((0, 0), [0., 0., 0., 1.]),
             fullscreen_size: Default::default(),
             open_animation: None,
             resize_animation: None,
-            move_animation: None,
+            move_x_animation: None,
+            move_y_animation: None,
             options,
         }
     }
 
     pub fn update_config(&mut self, options: Rc<Options>) {
-        self.border.update_config(options.border.into());
-        self.focus_ring.update_config(options.focus_ring);
+        let rules = self.window.rules();
+
+        let border_config = rules.border.resolve_against(self.options.border);
+        self.border.update_config(border_config.into());
+
+        let focus_ring_config = rules
+            .focus_ring
+            .resolve_against(self.options.focus_ring.into());
+        self.focus_ring.update_config(focus_ring_config.into());
+
         self.options = options;
     }
 
@@ -156,24 +165,24 @@ impl<W: LayoutElement> Tile<W> {
             let change = self.window.size().to_point() - size_from.to_point();
             let change = max(change.x.abs(), change.y.abs());
             if change > RESIZE_ANIMATION_THRESHOLD {
-                let anim = Animation::new(
-                    0.,
-                    1.,
-                    0.,
-                    self.options.animations.window_resize,
-                    niri_config::Animation::default_window_resize(),
-                );
+                let anim = Animation::new(0., 1., 0., self.options.animations.window_resize.anim);
                 self.resize_animation = Some(ResizeAnimation {
                     anim,
                     size_from,
                     snapshot: animate_from,
-                    snapshot_texture: OnceCell::new(),
-                    snapshot_blocked_out_texture: OnceCell::new(),
                 });
             } else {
                 self.resize_animation = None;
             }
         }
+
+        let rules = self.window.rules();
+        let border_config = rules.border.resolve_against(self.options.border);
+        self.border.update_config(border_config.into());
+        let focus_ring_config = rules
+            .focus_ring
+            .resolve_against(self.options.focus_ring.into());
+        self.focus_ring.update_config(focus_ring_config.into());
     }
 
     pub fn advance_animations(&mut self, current_time: Duration, is_active: bool) {
@@ -191,10 +200,16 @@ impl<W: LayoutElement> Tile<W> {
             }
         }
 
-        if let Some(move_) = &mut self.move_animation {
+        if let Some(move_) = &mut self.move_x_animation {
             move_.anim.set_current_time(current_time);
             if move_.anim.is_done() {
-                self.move_animation = None;
+                self.move_x_animation = None;
+            }
+        }
+        if let Some(move_) = &mut self.move_y_animation {
+            move_.anim.set_current_time(current_time);
+            if move_.anim.is_done() {
+                self.move_y_animation = None;
             }
         }
 
@@ -220,14 +235,18 @@ impl<W: LayoutElement> Tile<W> {
     pub fn are_animations_ongoing(&self) -> bool {
         self.open_animation.is_some()
             || self.resize_animation.is_some()
-            || self.move_animation.is_some()
+            || self.move_x_animation.is_some()
+            || self.move_y_animation.is_some()
     }
 
     pub fn render_offset(&self) -> Point<i32, Logical> {
         let mut offset = Point::from((0., 0.));
 
-        if let Some(move_) = &self.move_animation {
-            offset += move_.from.to_f64().upscale(move_.anim.value());
+        if let Some(move_) = &self.move_x_animation {
+            offset.x += f64::from(move_.from) * move_.anim.value();
+        }
+        if let Some(move_) = &self.move_y_animation {
+            offset.y += f64::from(move_.from) * move_.anim.value();
         }
 
         offset.to_i32_round()
@@ -238,8 +257,7 @@ impl<W: LayoutElement> Tile<W> {
             0.,
             1.,
             0.,
-            self.options.animations.window_open,
-            niri_config::Animation::default_window_open(),
+            self.options.animations.window_open.0,
         ));
     }
 
@@ -251,16 +269,45 @@ impl<W: LayoutElement> Tile<W> {
         self.resize_animation.as_ref().map(|resize| &resize.anim)
     }
 
-    pub fn animate_move_from_with_config(
-        &mut self,
-        from: Point<i32, Logical>,
-        config: niri_config::Animation,
-        default: niri_config::Animation,
-    ) {
-        let current_offset = self.render_offset();
+    pub fn animate_move_from(&mut self, from: Point<i32, Logical>) {
+        self.animate_move_x_from(from.x);
+        self.animate_move_y_from(from.y);
+    }
 
-        self.move_animation = Some(MoveAnimation {
-            anim: Animation::new(1., 0., 0., config, default),
+    pub fn animate_move_x_from(&mut self, from: i32) {
+        self.animate_move_x_from_with_config(from, self.options.animations.window_movement.0);
+    }
+
+    pub fn animate_move_x_from_with_config(&mut self, from: i32, config: niri_config::Animation) {
+        let current_offset = self.render_offset().x;
+
+        // Preserve the previous config if ongoing.
+        let anim = self.move_x_animation.take().map(|move_| move_.anim);
+        let anim = anim
+            .map(|anim| anim.restarted(1., 0., 0.))
+            .unwrap_or_else(|| Animation::new(1., 0., 0., config));
+
+        self.move_x_animation = Some(MoveAnimation {
+            anim,
+            from: from + current_offset,
+        });
+    }
+
+    pub fn animate_move_y_from(&mut self, from: i32) {
+        self.animate_move_y_from_with_config(from, self.options.animations.window_movement.0);
+    }
+
+    pub fn animate_move_y_from_with_config(&mut self, from: i32, config: niri_config::Animation) {
+        let current_offset = self.render_offset().y;
+
+        // Preserve the previous config if ongoing.
+        let anim = self.move_y_animation.take().map(|move_| move_.anim);
+        let anim = anim
+            .map(|anim| anim.restarted(1., 0., 0.))
+            .unwrap_or_else(|| Animation::new(1., 0., 0., config));
+
+        self.move_y_animation = Some(MoveAnimation {
+            anim,
             from: from + current_offset,
         });
     }
@@ -275,6 +322,10 @@ impl<W: LayoutElement> Tile<W> {
 
     pub fn into_window(self) -> W {
         self.window
+    }
+
+    pub fn is_fullscreen(&self) -> bool {
+        self.is_fullscreen
     }
 
     /// Returns `None` if the border is hidden and `Some(width)` if it should be shown.
@@ -347,7 +398,9 @@ impl<W: LayoutElement> Tile<W> {
             let size_from = resize.size_from;
 
             size.w = (size_from.w as f64 + (size.w - size_from.w) as f64 * val).round() as i32;
+            size.w = max(1, size.w);
             size.h = (size_from.h as f64 + (size.h - size_from.h) as f64 * val).round() as i32;
+            size.h = max(1, size.h);
         }
 
         size
@@ -493,13 +546,13 @@ impl<W: LayoutElement> Tile<W> {
 
         let gles_renderer = renderer.as_gles_renderer();
 
-        // If we're resizing, try to render a crossfade, or a fallback.
-        let mut crossfade = None;
-        let mut crossfade_fallback = None;
+        // If we're resizing, try to render a shader, or a fallback.
+        let mut resize_shader = None;
+        let mut resize_fallback = None;
 
         if let Some(resize) = &self.resize_animation {
-            if Shaders::get(gles_renderer).crossfade.is_some() {
-                if let Some(texture_from) = resize.rendered_texture(gles_renderer, scale, target) {
+            if let Some(shader) = ResizeRenderElement::shader(gles_renderer) {
+                if let Some(texture_from) = resize.snapshot.texture(gles_renderer, scale, target) {
                     let window_elements =
                         self.window
                             .render(gles_renderer, Point::from((0, 0)), scale, 1., target);
@@ -514,28 +567,28 @@ impl<W: LayoutElement> Tile<W> {
                     .ok();
 
                     if let Some((texture_current, _sync_point, texture_current_geo)) = current {
-                        let elem = CrossfadeRenderElement::new(
-                            gles_renderer,
+                        let elem = ResizeRenderElement::new(
+                            shader,
                             area,
                             scale,
                             texture_from.clone(),
                             resize.snapshot.size,
                             (texture_current, texture_current_geo),
                             window_size,
+                            resize.anim.value() as f32,
                             resize.anim.clamped_value().clamp(0., 1.) as f32,
                             alpha,
-                        )
-                        .expect("we checked the crossfade shader above");
+                        );
                         self.window
                             .set_offscreen_element_id(Some(elem.id().clone()));
-                        crossfade = Some(elem.into());
+                        resize_shader = Some(elem.into());
                     }
                 }
             }
 
-            if crossfade.is_none() {
+            if resize_shader.is_none() {
                 let fallback_buffer = SolidColorBuffer::new(area.size, [1., 0., 0., 1.]);
-                crossfade_fallback = Some(
+                resize_fallback = Some(
                     SolidColorRenderElement::from_buffer(
                         &fallback_buffer,
                         area.loc.to_physical_precise_round(scale),
@@ -551,7 +604,7 @@ impl<W: LayoutElement> Tile<W> {
 
         // If we're not resizing, render the window itself.
         let mut window = None;
-        if crossfade.is_none() && crossfade_fallback.is_none() {
+        if resize_shader.is_none() && resize_fallback.is_none() {
             window = Some(
                 self.window
                     .render(renderer, window_render_loc, scale, alpha, target)
@@ -560,10 +613,22 @@ impl<W: LayoutElement> Tile<W> {
             );
         }
 
-        let rv = crossfade
+        let rv = resize_shader
             .into_iter()
-            .chain(crossfade_fallback)
+            .chain(resize_fallback)
             .chain(window.into_iter().flatten());
+
+        let elem = self.is_fullscreen.then(|| {
+            SolidColorRenderElement::from_buffer(
+                &self.fullscreen_backdrop,
+                location.to_physical_precise_round(scale),
+                scale,
+                1.,
+                Kind::Unspecified,
+            )
+            .into()
+        });
+        let rv = rv.chain(elem);
 
         let elem = self.effective_border_width().map(|width| {
             self.border
@@ -582,19 +647,7 @@ impl<W: LayoutElement> Tile<W> {
                 .render(renderer, location, scale, view_size)
                 .map(Into::into)
         });
-        let rv = rv.chain(elem.into_iter().flatten());
-
-        let elem = self.is_fullscreen.then(|| {
-            SolidColorRenderElement::from_buffer(
-                &self.fullscreen_backdrop,
-                location.to_physical_precise_round(scale),
-                scale,
-                1.,
-                Kind::Unspecified,
-            )
-            .into()
-        });
-        rv.chain(elem)
+        rv.chain(elem.into_iter().flatten())
     }
 
     pub fn render<R: NiriRenderer>(
@@ -702,13 +755,10 @@ impl<W: LayoutElement> Tile<W> {
         renderer: &mut GlesRenderer,
         scale: Scale<f64>,
         view_size: Size<i32, Logical>,
-    ) -> RenderSnapshot<TileSnapshotRenderElement, TileSnapshotRenderElement> {
-        let snapshot = self.window.take_last_render();
-        if snapshot.contents.is_empty() {
-            return RenderSnapshot::default();
-        }
+    ) -> Option<RenderSnapshot<TileSnapshotRenderElement, TileSnapshotRenderElement>> {
+        let snapshot = self.window.take_unmap_snapshot()?;
 
-        RenderSnapshot {
+        Some(RenderSnapshot {
             contents: self.render_snapshot(renderer, scale, view_size, snapshot.contents),
             blocked_out_contents: self.render_snapshot(
                 renderer,
@@ -717,79 +767,9 @@ impl<W: LayoutElement> Tile<W> {
                 snapshot.blocked_out_contents,
             ),
             block_out_from: snapshot.block_out_from,
-        }
-    }
-}
-
-impl ResizeAnimation {
-    fn rendered_texture(
-        &self,
-        renderer: &mut GlesRenderer,
-        scale: Scale<f64>,
-        target: RenderTarget,
-    ) -> &Option<(GlesTexture, Rectangle<i32, Physical>)> {
-        let block_out = match self.snapshot.render.block_out_from {
-            None => false,
-            Some(BlockOutFrom::Screencast) => target == RenderTarget::Screencast,
-            Some(BlockOutFrom::ScreenCapture) => target != RenderTarget::Output,
-        };
-
-        if block_out {
-            self.snapshot_blocked_out_texture.get_or_init(|| {
-                let _span = tracy_client::span!("ResizeAnimation::rendered_texture");
-
-                let elements: Vec<_> = self
-                    .snapshot
-                    .render
-                    .blocked_out_contents
-                    .iter()
-                    .map(|baked| {
-                        baked.to_render_element(Point::from((0, 0)), scale, 1., Kind::Unspecified)
-                    })
-                    .collect();
-
-                match render_to_encompassing_texture(
-                    renderer,
-                    scale,
-                    Transform::Normal,
-                    Fourcc::Abgr8888,
-                    &elements,
-                ) {
-                    Ok((texture, _sync_point, geo)) => Some((texture, geo)),
-                    Err(err) => {
-                        warn!("error rendering snapshot to texture: {err:?}");
-                        None
-                    }
-                }
-            })
-        } else {
-            self.snapshot_texture.get_or_init(|| {
-                let _span = tracy_client::span!("ResizeAnimation::rendered_texture");
-
-                let elements: Vec<_> = self
-                    .snapshot
-                    .render
-                    .contents
-                    .iter()
-                    .map(|baked| {
-                        baked.to_render_element(Point::from((0, 0)), scale, 1., Kind::Unspecified)
-                    })
-                    .collect();
-
-                match render_to_encompassing_texture(
-                    renderer,
-                    scale,
-                    Transform::Normal,
-                    Fourcc::Abgr8888,
-                    &elements,
-                ) {
-                    Ok((texture, _sync_point, geo)) => Some((texture, geo)),
-                    Err(err) => {
-                        warn!("error rendering snapshot to texture: {err:?}");
-                        None
-                    }
-                }
-            })
-        }
+            size: self.animated_tile_size(),
+            texture: Default::default(),
+            blocked_out_texture: Default::default(),
+        })
     }
 }

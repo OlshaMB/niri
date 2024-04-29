@@ -73,6 +73,8 @@ impl Winit {
                     is_preferred: true,
                 }],
                 current_mode: Some(0),
+                vrr_supported: false,
+                vrr_enabled: false,
                 logical: Some(logical_output(&output)),
             },
         )])));
@@ -133,7 +135,13 @@ impl Winit {
         resources::init(renderer);
         shaders::init(renderer);
 
-        niri.add_output(self.output.clone(), None);
+        let config = self.config.borrow();
+        if let Some(src) = config.animations.window_resize.custom_shader.as_deref() {
+            shaders::set_custom_resize_program(renderer, Some(src));
+        }
+        drop(config);
+
+        niri.add_output(self.output.clone(), None, false);
     }
 
     pub fn seat_name(&self) -> String {

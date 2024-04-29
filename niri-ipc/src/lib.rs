@@ -6,18 +6,22 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-/// Name of the environment variable containing the niri IPC socket path.
-pub const SOCKET_PATH_ENV: &str = "NIRI_SOCKET";
+mod socket;
+pub use socket::{Socket, SOCKET_PATH_ENV};
 
 /// Request from client to niri.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Request {
+    /// Request the version string for the running niri instance.
+    Version,
     /// Request information about connected outputs.
     Outputs,
     /// Request information about the focused window.
     FocusedWindow,
     /// Perform an action.
     Action(Action),
+    /// Respond with an error (for testing error handling).
+    ReturnError,
 }
 
 /// Reply from niri to client.
@@ -35,6 +39,8 @@ pub type Reply = Result<Response, String>;
 pub enum Response {
     /// A request that does not need a response was handled successfully.
     Handled,
+    /// The version string for the running niri instance.
+    Version(String),
     /// Information about connected outputs.
     ///
     /// Map from connector name to output info.
@@ -252,6 +258,10 @@ pub struct Output {
     ///
     /// `None` if the output is disabled.
     pub current_mode: Option<usize>,
+    /// Whether the output supports variable refresh rate.
+    pub vrr_supported: bool,
+    /// Whether variable refresh rate is enabled on the output.
+    pub vrr_enabled: bool,
     /// Logical output information.
     ///
     /// `None` if the output is not mapped to any logical output (for example, if it is disabled).

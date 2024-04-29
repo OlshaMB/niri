@@ -15,6 +15,8 @@ pub static ANIMATION_SLOWDOWN: AtomicF64 = AtomicF64::new(1.);
 pub struct Animation {
     from: f64,
     to: f64,
+    initial_velocity: f64,
+    is_off: bool,
     duration: Duration,
     /// Time until the animation first reaches `to`.
     ///
@@ -45,60 +47,95 @@ pub enum Curve {
 }
 
 impl Animation {
-    pub fn new(
-        from: f64,
-        to: f64,
-        initial_velocity: f64,
-        config: niri_config::Animation,
-        default: niri_config::Animation,
-    ) -> Self {
+    pub fn new(from: f64, to: f64, initial_velocity: f64, config: niri_config::Animation) -> Self {
+        // Scale the velocity by slowdown to keep the touchpad gestures feeling right.
+        let initial_velocity = initial_velocity * ANIMATION_SLOWDOWN.load(Ordering::Relaxed);
+
+        let mut rv = Self::ease(from, to, initial_velocity, 0, Curve::EaseOutCubic);
         if config.off {
-            return Self::ease(from, to, 0, Curve::EaseOutCubic);
+            rv.is_off = true;
+            return rv;
         }
 
-        // Resolve defaults.
-        let (kind, easing_defaults) = match (config.kind, default.kind) {
-            // Configured spring.
-            (configured @ niri_config::AnimationKind::Spring(_), _) => (configured, None),
-            // Configured nothing, defaults spring.
-            (
-                niri_config::AnimationKind::Easing(easing),
-                defaults @ niri_config::AnimationKind::Spring(_),
-            ) if easing == niri_config::EasingParams::unfilled() => (defaults, None),
-            // Configured easing or nothing, defaults easing.
-            (
-                configured @ niri_config::AnimationKind::Easing(_),
-                niri_config::AnimationKind::Easing(defaults),
-            ) => (configured, Some(defaults)),
-            // Configured easing, defaults spring.
-            (
-                configured @ niri_config::AnimationKind::Easing(_),
-                niri_config::AnimationKind::Spring(_),
-            ) => (configured, None),
-        };
+        rv.replace_config(config);
+        rv
+    }
 
-        match kind {
+    pub fn replace_config(&mut self, config: niri_config::Animation) {
+        self.is_off = config.off;
+        if config.off {
+            self.duration = Duration::ZERO;
+            self.clamped_duration = Duration::ZERO;
+            return;
+        }
+
+        let start_time = self.start_time;
+        let current_time = self.current_time;
+
+        match config.kind {
             niri_config::AnimationKind::Spring(p) => {
                 let params = SpringParams::new(p.damping_ratio, f64::from(p.stiffness), p.epsilon);
 
                 let spring = Spring {
-                    from,
-                    to,
-                    initial_velocity,
+                    from: self.from,
+                    to: self.to,
+                    initial_velocity: self.initial_velocity,
                     params,
+                };
+                *self = Self::spring(spring);
+            }
+            niri_config::AnimationKind::Easing(p) => {
+                *self = Self::ease(
+                    self.from,
+                    self.to,
+                    self.initial_velocity,
+                    u64::from(p.duration_ms),
+                    Curve::from(p.curve),
+                );
+            }
+        }
+
+        self.start_time = start_time;
+        self.current_time = current_time;
+    }
+
+    /// Restarts the animation using the previous config.
+    pub fn restarted(self, from: f64, to: f64, initial_velocity: f64) -> Self {
+        if self.is_off {
+            return self;
+        }
+
+        // Scale the velocity by slowdown to keep the touchpad gestures feeling right.
+        let initial_velocity = initial_velocity * ANIMATION_SLOWDOWN.load(Ordering::Relaxed);
+
+        match self.kind {
+            Kind::Easing { curve } => Self::ease(
+                from,
+                to,
+                initial_velocity,
+                self.duration.as_millis() as u64,
+                curve,
+            ),
+            Kind::Spring(spring) => {
+                let spring = Spring {
+                    from: self.from,
+                    to: self.to,
+                    initial_velocity: self.initial_velocity,
+                    params: spring.params,
                 };
                 Self::spring(spring)
             }
-            niri_config::AnimationKind::Easing(p) => {
-                let defaults = easing_defaults.unwrap_or(niri_config::EasingParams::default());
-                let duration_ms = p.duration_ms.or(defaults.duration_ms).unwrap();
-                let curve = Curve::from(p.curve.or(defaults.curve).unwrap());
-                Self::ease(from, to, u64::from(duration_ms), curve)
+            Kind::Deceleration {
+                initial_velocity,
+                deceleration_rate,
+            } => {
+                let threshold = 0.001; // FIXME
+                Self::decelerate(from, initial_velocity, deceleration_rate, threshold)
             }
         }
     }
 
-    pub fn ease(from: f64, to: f64, duration_ms: u64, curve: Curve) -> Self {
+    pub fn ease(from: f64, to: f64, initial_velocity: f64, duration_ms: u64, curve: Curve) -> Self {
         // FIXME: ideally we shouldn't use current time here because animations started within the
         // same frame cycle should have the same start time to be synchronized.
         let now = get_monotonic_time();
@@ -109,6 +146,8 @@ impl Animation {
         Self {
             from,
             to,
+            initial_velocity,
+            is_off: false,
             duration,
             // Our current curves never overshoot.
             clamped_duration: duration,
@@ -132,6 +171,8 @@ impl Animation {
         Self {
             from: spring.from,
             to: spring.to,
+            initial_velocity: spring.initial_velocity,
+            is_off: false,
             duration,
             clamped_duration,
             start_time: now,
@@ -168,6 +209,8 @@ impl Animation {
         Self {
             from,
             to,
+            initial_velocity,
+            is_off: false,
             duration,
             clamped_duration: duration,
             start_time: now,
@@ -257,7 +300,19 @@ impl Animation {
                 let x = (passed / total).clamp(0., 1.);
                 curve.y(x) * (self.to - self.from) + self.from
             }
-            Kind::Spring(spring) => spring.value_at(passed),
+            Kind::Spring(spring) => {
+                let value = spring.value_at(passed);
+
+                // Protect against numerical instability.
+                let range = (self.to - self.from) * 10.;
+                let a = self.from - range;
+                let b = self.to + range;
+                if self.from <= self.to {
+                    value.clamp(a, b)
+                } else {
+                    value.clamp(b, a)
+                }
+            }
             Kind::Deceleration {
                 initial_velocity,
                 deceleration_rate,

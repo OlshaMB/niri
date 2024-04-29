@@ -50,7 +50,8 @@ pub use self::monitor::MonitorRenderElement;
 use self::workspace::{compute_working_area, Column, ColumnWidth, OutputId, Workspace};
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
-use crate::render_helpers::{BakedBuffer, RenderSnapshot, RenderTarget};
+use crate::render_helpers::snapshot::RenderSnapshot;
+use crate::render_helpers::{BakedBuffer, RenderTarget};
 use crate::utils::output_size;
 use crate::window::ResolvedWindowRules;
 
@@ -72,15 +73,6 @@ niri_render_elements! {
 
 pub type LayoutElementRenderSnapshot =
     RenderSnapshot<BakedBuffer<TextureBuffer<GlesTexture>>, BakedBuffer<SolidColorBuffer>>;
-
-/// Snapshot of an element for animation.
-#[derive(Debug)]
-pub struct AnimationSnapshot {
-    /// Snapshot of the render.
-    pub render: LayoutElementRenderSnapshot,
-    /// Visual size of the element at the point of the snapshot.
-    pub size: Size<i32, Logical>,
-}
 
 pub trait LayoutElement {
     /// Type that can be used as a unique ID of this element.
@@ -118,8 +110,6 @@ pub trait LayoutElement {
         target: RenderTarget,
     ) -> Vec<LayoutElementRenderElement<R>>;
 
-    fn take_last_render(&self) -> LayoutElementRenderSnapshot;
-
     fn request_size(&mut self, size: Size<i32, Logical>, animate: bool);
     fn request_fullscreen(&self, size: Size<i32, Logical>);
     fn min_size(&self) -> Size<i32, Logical>;
@@ -150,8 +140,10 @@ pub trait LayoutElement {
     /// Runs periodic clean-up tasks.
     fn refresh(&self);
 
-    fn animation_snapshot(&self) -> Option<&AnimationSnapshot>;
-    fn take_animation_snapshot(&mut self) -> Option<AnimationSnapshot>;
+    fn take_unmap_snapshot(&self) -> Option<LayoutElementRenderSnapshot>;
+
+    fn animation_snapshot(&self) -> Option<&LayoutElementRenderSnapshot>;
+    fn take_animation_snapshot(&mut self) -> Option<LayoutElementRenderSnapshot>;
 }
 
 #[derive(Debug)]
@@ -246,7 +238,7 @@ impl Options {
             center_focused_column: layout.center_focused_column,
             preset_widths,
             default_width,
-            animations: config.animations,
+            animations: config.animations.clone(),
         }
     }
 }
@@ -471,8 +463,10 @@ impl<W: LayoutElement> Layout<W> {
     ) -> Option<&Output> {
         let mut width = width.unwrap_or_else(|| ColumnWidth::Fixed(window.size().w));
         if let ColumnWidth::Fixed(w) = &mut width {
-            if !self.options.border.off {
-                *w += self.options.border.width as i32 * 2;
+            let rules = window.rules();
+            let border_config = rules.border.resolve_against(self.options.border);
+            if !border_config.off {
+                *w += border_config.width as i32 * 2;
             }
         }
 
@@ -527,8 +521,10 @@ impl<W: LayoutElement> Layout<W> {
     ) -> Option<&Output> {
         let mut width = width.unwrap_or_else(|| ColumnWidth::Fixed(window.size().w));
         if let ColumnWidth::Fixed(w) = &mut width {
-            if !self.options.border.off {
-                *w += self.options.border.width as i32 * 2;
+            let rules = window.rules();
+            let border_config = rules.border.resolve_against(self.options.border);
+            if !border_config.off {
+                *w += border_config.width as i32 * 2;
             }
         }
 
@@ -563,8 +559,10 @@ impl<W: LayoutElement> Layout<W> {
     ) {
         let mut width = width.unwrap_or_else(|| ColumnWidth::Fixed(window.size().w));
         if let ColumnWidth::Fixed(w) = &mut width {
-            if !self.options.border.off {
-                *w += self.options.border.width as i32 * 2;
+            let rules = window.rules();
+            let border_config = rules.border.resolve_against(self.options.border);
+            if !border_config.off {
+                *w += border_config.width as i32 * 2;
             }
         }
 
@@ -1434,7 +1432,9 @@ impl<W: LayoutElement> Layout<W> {
             let column = &ws.columns[ws.active_column_idx];
             let width = column.width;
             let is_full_width = column.is_full_width;
-            let window = ws.remove_window_by_idx(ws.active_column_idx, column.active_tile_idx);
+            let window = ws
+                .remove_tile_by_idx(ws.active_column_idx, column.active_tile_idx, None)
+                .into_window();
 
             let workspace_idx = monitors[new_idx].active_workspace_idx;
             self.add_window_by_idx(new_idx, workspace_idx, window, true, width, is_full_width);
@@ -1723,22 +1723,10 @@ impl<W: LayoutElement> Layout<W> {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
                     for ws in &mut mon.workspaces {
-                        for (col_idx, col) in ws.columns.iter_mut().enumerate() {
+                        for col in &mut ws.columns {
                             for tile in &mut col.tiles {
                                 if tile.window().id() == window {
                                     tile.start_open_animation();
-
-                                    let offset = ws.column_x(col_idx + 1) - ws.column_x(col_idx);
-                                    if ws.active_column_idx <= col_idx {
-                                        for col in &mut ws.columns[col_idx + 1..] {
-                                            col.animate_move_from(-offset);
-                                        }
-                                    } else {
-                                        for col in &mut ws.columns[..col_idx] {
-                                            col.animate_move_from(offset);
-                                        }
-                                    }
-
                                     return;
                                 }
                             }
@@ -1748,22 +1736,10 @@ impl<W: LayoutElement> Layout<W> {
             }
             MonitorSet::NoOutputs { workspaces, .. } => {
                 for ws in workspaces {
-                    for (col_idx, col) in ws.columns.iter_mut().enumerate() {
+                    for col in &mut ws.columns {
                         for tile in &mut col.tiles {
                             if tile.window().id() == window {
                                 tile.start_open_animation();
-
-                                let offset = ws.column_x(col_idx + 1) - ws.column_x(col_idx);
-                                if ws.active_column_idx <= col_idx {
-                                    for col in &mut ws.columns[col_idx + 1..] {
-                                        col.animate_move_from(-offset);
-                                    }
-                                } else {
-                                    for col in &mut ws.columns[..col_idx] {
-                                        col.animate_move_from(offset);
-                                    }
-                                }
-
                                 return;
                             }
                         }
@@ -1966,10 +1942,6 @@ mod tests {
             vec![]
         }
 
-        fn take_last_render(&self) -> LayoutElementRenderSnapshot {
-            RenderSnapshot::default()
-        }
-
         fn request_size(&mut self, size: Size<i32, Logical>, _animate: bool) {
             self.0.requested_size.set(Some(size));
             self.0.pending_fullscreen.set(false);
@@ -2024,11 +1996,15 @@ mod tests {
             &EMPTY
         }
 
-        fn animation_snapshot(&self) -> Option<&AnimationSnapshot> {
+        fn take_unmap_snapshot(&self) -> Option<LayoutElementRenderSnapshot> {
             None
         }
 
-        fn take_animation_snapshot(&mut self) -> Option<AnimationSnapshot> {
+        fn animation_snapshot(&self) -> Option<&LayoutElementRenderSnapshot> {
+            None
+        }
+
+        fn take_animation_snapshot(&mut self) -> Option<LayoutElementRenderSnapshot> {
             None
         }
     }
@@ -3043,6 +3019,107 @@ mod tests {
             mon.workspaces[0].active_column_idx, 1,
             "the new window must become active"
         );
+    }
+
+    #[test]
+    fn unfullscreen_view_offset_not_reset_on_removal() {
+        let ops = [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                id: 0,
+                bbox: Rectangle::from_loc_and_size((0, 0), (100, 200)),
+                min_max_size: Default::default(),
+            },
+            Op::FullscreenWindow(0),
+            Op::AddWindow {
+                id: 1,
+                bbox: Rectangle::from_loc_and_size((0, 0), (100, 200)),
+                min_max_size: Default::default(),
+            },
+            Op::ConsumeOrExpelWindowRight,
+        ];
+
+        check_ops(&ops);
+    }
+
+    #[test]
+    fn unfullscreen_view_offset_not_reset_on_consume() {
+        let ops = [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                id: 0,
+                bbox: Rectangle::from_loc_and_size((0, 0), (100, 200)),
+                min_max_size: Default::default(),
+            },
+            Op::FullscreenWindow(0),
+            Op::AddWindow {
+                id: 1,
+                bbox: Rectangle::from_loc_and_size((0, 0), (100, 200)),
+                min_max_size: Default::default(),
+            },
+            Op::ConsumeWindowIntoColumn,
+        ];
+
+        check_ops(&ops);
+    }
+
+    #[test]
+    fn unfullscreen_view_offset_not_reset_on_quick_double_toggle() {
+        let ops = [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                id: 0,
+                bbox: Rectangle::from_loc_and_size((0, 0), (100, 200)),
+                min_max_size: Default::default(),
+            },
+            Op::FullscreenWindow(0),
+            Op::FullscreenWindow(0),
+        ];
+
+        check_ops(&ops);
+    }
+
+    #[test]
+    fn unfullscreen_view_offset_set_on_fullscreening_inactive_tile_in_column() {
+        let ops = [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                id: 0,
+                bbox: Rectangle::from_loc_and_size((0, 0), (100, 200)),
+                min_max_size: Default::default(),
+            },
+            Op::AddWindow {
+                id: 1,
+                bbox: Rectangle::from_loc_and_size((0, 0), (100, 200)),
+                min_max_size: Default::default(),
+            },
+            Op::ConsumeOrExpelWindowLeft,
+            Op::FullscreenWindow(0),
+        ];
+
+        check_ops(&ops);
+    }
+
+    #[test]
+    fn unfullscreen_view_offset_not_reset_on_gesture() {
+        let ops = [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                id: 0,
+                bbox: Rectangle::from_loc_and_size((0, 0), (200, 200)),
+                min_max_size: Default::default(),
+            },
+            Op::AddWindow {
+                id: 1,
+                bbox: Rectangle::from_loc_and_size((0, 0), (1280, 200)),
+                min_max_size: Default::default(),
+            },
+            Op::FullscreenWindow(1),
+            Op::ViewOffsetGestureBegin { output_idx: 1 },
+            Op::ViewOffsetGestureEnd,
+        ];
+
+        check_ops(&ops);
     }
 
     fn arbitrary_spacing() -> impl Strategy<Value = u16> {

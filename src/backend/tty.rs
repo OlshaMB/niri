@@ -171,6 +171,7 @@ struct Surface {
     gamma_props: Option<GammaProps>,
     /// Gamma change to apply upon session resume.
     pending_gamma_change: Option<Option<Vec<u16>>>,
+    vrr_enabled: bool,
     /// Tracy frame that goes from vblank to vblank.
     vblank_frame: Option<tracy_client::Frame>,
     /// Frame name for the VBlank frame.
@@ -490,8 +491,15 @@ impl Tty {
                 warn!("error binding wl-display in EGL: {err:?}");
             }
 
-            resources::init(renderer.as_gles_renderer());
-            shaders::init(renderer.as_gles_renderer());
+            let gles_renderer = renderer.as_gles_renderer();
+            resources::init(gles_renderer);
+            shaders::init(gles_renderer);
+
+            let config = self.config.borrow();
+            if let Some(src) = config.animations.window_resize.custom_shader.as_deref() {
+                shaders::set_custom_resize_program(gles_renderer, Some(src));
+            }
+            drop(config);
 
             // Create the dmabuf global.
             let primary_formats = renderer.dmabuf_formats().collect::<HashSet<_>>();
@@ -680,21 +688,8 @@ impl Tty {
 
         let device = self.devices.get_mut(&node).context("missing device")?;
 
-        let non_desktop = device
-            .drm
-            .get_properties(connector.handle())
-            .ok()
-            .and_then(|props| {
-                let (info, value) = props
-                    .into_iter()
-                    .filter_map(|(handle, value)| {
-                        let info = device.drm.get_property(handle).ok()?;
-                        Some((info, value))
-                    })
-                    .find(|(info, _)| info.name().to_str() == Ok("non-desktop"))?;
-
-                info.value_type().convert_value(value).as_boolean()
-            })
+        let non_desktop = find_drm_property(&device.drm, connector.handle(), "non-desktop")
+            .and_then(|(_, info, value)| info.value_type().convert_value(value).as_boolean())
             .unwrap_or(false);
 
         if non_desktop {
@@ -750,6 +745,47 @@ impl Tty {
         match set_max_bpc(&device.drm, connector.handle(), 8) {
             Ok(bpc) => debug!("set max bpc to {bpc}"),
             Err(err) => debug!("error setting max bpc: {err:?}"),
+        }
+
+        // Try to enable VRR if requested.
+        let mut vrr_enabled = false;
+        if let Some(capable) = is_vrr_capable(&device.drm, connector.handle()) {
+            if capable {
+                let word = if config.variable_refresh_rate {
+                    "enabling"
+                } else {
+                    "disabling"
+                };
+
+                match set_vrr_enabled(&device.drm, crtc, config.variable_refresh_rate) {
+                    Ok(enabled) => {
+                        if enabled != config.variable_refresh_rate {
+                            warn!("failed {} VRR", word);
+                        }
+
+                        vrr_enabled = enabled;
+                    }
+                    Err(err) => {
+                        warn!("error {} VRR: {err:?}", word);
+                    }
+                }
+            } else {
+                if config.variable_refresh_rate {
+                    warn!("cannot enable VRR because connector is not vrr_capable");
+                }
+
+                // Try to disable it anyway to work around a bug where resetting DRM state causes
+                // vrr_capable to be reset to 0, potentially leaving VRR_ENABLED at 1.
+                let res = set_vrr_enabled(&device.drm, crtc, config.variable_refresh_rate);
+                if matches!(res, Ok(true)) {
+                    warn!("error disabling VRR");
+
+                    // So that we can try it again later.
+                    vrr_enabled = true;
+                }
+            }
+        } else if config.variable_refresh_rate {
+            warn!("cannot enable VRR because connector is not vrr_capable");
         }
 
         let mut gamma_props = GammaProps::new(&device.drm, crtc)
@@ -825,6 +861,28 @@ impl Tty {
         let egl_context = renderer.as_ref().egl_context();
         let render_formats = egl_context.dmabuf_render_formats();
 
+        // Filter out the CCS modifiers as they have increased bandwidth, causing some monitor
+        // configurations to stop working.
+        let mut render_formats = render_formats.clone();
+        render_formats.retain(|format| {
+            !matches!(
+                format.modifier,
+                Modifier::I915_y_tiled_ccs
+                    // I915_FORMAT_MOD_Yf_TILED_CCS
+                    | Modifier::Unrecognized(0x100000000000005)
+                    | Modifier::I915_y_tiled_gen12_rc_ccs
+                    | Modifier::I915_y_tiled_gen12_mc_ccs
+                    // I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC
+                    | Modifier::Unrecognized(0x100000000000008)
+                    // I915_FORMAT_MOD_4_TILED_DG2_RC_CCS
+                    | Modifier::Unrecognized(0x10000000000000a)
+                    // I915_FORMAT_MOD_4_TILED_DG2_MC_CCS
+                    | Modifier::Unrecognized(0x10000000000000b)
+                    // I915_FORMAT_MOD_4_TILED_DG2_RC_CCS_CC
+                    | Modifier::Unrecognized(0x10000000000000c)
+            )
+        });
+
         // Create the compositor.
         let mut compositor = DrmCompositor::new(
             OutputModeSource::Auto(output.clone()),
@@ -842,6 +900,7 @@ impl Tty {
         if self.debug_tint {
             compositor.set_debug_flags(DebugFlags::TINT);
         }
+        compositor.use_direct_scanout(!config.debug.disable_direct_scanout);
 
         let mut dmabuf_feedback = None;
         if let Ok(primary_renderer) = self.gpu_manager.single_renderer(&self.primary_render_node) {
@@ -877,6 +936,7 @@ impl Tty {
             compositor,
             dmabuf_feedback,
             gamma_props,
+            vrr_enabled,
             pending_gamma_change: None,
             vblank_frame: None,
             vblank_frame_name,
@@ -887,7 +947,7 @@ impl Tty {
         let res = device.surfaces.insert(crtc, surface);
         assert!(res.is_none(), "crtc must not have already existed");
 
-        niri.add_output(output.clone(), Some(refresh_interval(mode)));
+        niri.add_output(output.clone(), Some(refresh_interval(mode)), vrr_enabled);
 
         // Power on all monitors if necessary and queue a redraw on the new one.
         niri.event_loop.insert_idle(move |state| {
@@ -1421,6 +1481,9 @@ impl Tty {
                     }
                 }
 
+                let vrr_supported = is_vrr_capable(&device.drm, connector.handle()) == Some(true);
+                let vrr_enabled = surface.map_or(false, |surface| surface.vrr_enabled);
+
                 let logical = niri
                     .global_space
                     .outputs()
@@ -1437,6 +1500,8 @@ impl Tty {
                     physical_size,
                     modes,
                     current_mode,
+                    vrr_supported,
+                    vrr_enabled,
                     logical,
                 };
 
@@ -1524,7 +1589,9 @@ impl Tty {
                     continue;
                 };
 
-                if surface.compositor.pending_mode() == mode {
+                let change_mode = surface.compositor.pending_mode() != mode;
+                let change_vrr = surface.vrr_enabled != config.variable_refresh_rate;
+                if !change_mode && !change_vrr {
                     continue;
                 }
 
@@ -1545,33 +1612,65 @@ impl Tty {
                     continue;
                 };
 
-                if fallback {
-                    let target = config.mode.unwrap();
-                    warn!(
-                        "output {:?}: configured mode {}x{}{} could not be found, \
-                         falling back to preferred",
-                        surface.name,
-                        target.width,
-                        target.height,
-                        if let Some(refresh) = target.refresh {
-                            format!("@{refresh}")
+                if change_vrr {
+                    if is_vrr_capable(&device.drm, connector.handle()) == Some(true) {
+                        let word = if config.variable_refresh_rate {
+                            "enabling"
                         } else {
-                            String::new()
-                        },
-                    );
+                            "disabling"
+                        };
+
+                        match set_vrr_enabled(&device.drm, crtc, config.variable_refresh_rate) {
+                            Ok(enabled) => {
+                                if enabled != config.variable_refresh_rate {
+                                    warn!("output {:?}: failed {} VRR", surface.name, word);
+                                }
+
+                                surface.vrr_enabled = enabled;
+                                output_state.frame_clock.set_vrr(enabled);
+                            }
+                            Err(err) => {
+                                warn!("output {:?}: error {} VRR: {err:?}", surface.name, word);
+                            }
+                        }
+                    } else if config.variable_refresh_rate {
+                        warn!(
+                            "output {:?}: cannot enable VRR because connector is not vrr_capable",
+                            surface.name
+                        );
+                    }
                 }
 
-                debug!("output {:?}: picking mode: {mode:?}", surface.name);
-                if let Err(err) = surface.compositor.use_mode(mode) {
-                    warn!("error changing mode: {err:?}");
-                    continue;
-                }
+                if change_mode {
+                    if fallback {
+                        let target = config.mode.unwrap();
+                        warn!(
+                            "output {:?}: configured mode {}x{}{} could not be found, \
+                             falling back to preferred",
+                            surface.name,
+                            target.width,
+                            target.height,
+                            if let Some(refresh) = target.refresh {
+                                format!("@{refresh}")
+                            } else {
+                                String::new()
+                            },
+                        );
+                    }
 
-                let wl_mode = Mode::from(mode);
-                output.change_current_state(Some(wl_mode), None, None, None);
-                output.set_preferred(wl_mode);
-                output_state.frame_clock = FrameClock::new(Some(refresh_interval(mode)));
-                niri.output_resized(&output);
+                    debug!("output {:?}: picking mode: {mode:?}", surface.name);
+                    if let Err(err) = surface.compositor.use_mode(mode) {
+                        warn!("error changing mode: {err:?}");
+                        continue;
+                    }
+
+                    let wl_mode = Mode::from(mode);
+                    output.change_current_state(Some(wl_mode), None, None, None);
+                    output.set_preferred(wl_mode);
+                    output_state.frame_clock =
+                        FrameClock::new(Some(refresh_interval(mode)), surface.vrr_enabled);
+                    niri.output_resized(&output);
+                }
             }
 
             for (connector, crtc) in device.drm_scanner.crtcs() {
@@ -1617,6 +1716,19 @@ impl Tty {
         }
 
         self.refresh_ipc_outputs(niri);
+    }
+
+    pub fn on_debug_config_changed(&mut self) {
+        let config = self.config.borrow();
+        let debug = &config.debug;
+        let use_direct_scanout = !debug.disable_direct_scanout;
+
+        // FIXME: reload other flags if possible?
+        for device in self.devices.values_mut() {
+            for surface in device.surfaces.values_mut() {
+                surface.compositor.use_direct_scanout(use_direct_scanout);
+            }
+        }
     }
 
     pub fn get_device_from_node(&mut self, node: DrmNode) -> Option<&mut OutputDevice> {
@@ -1856,7 +1968,7 @@ fn find_drm_property(
     drm: &DrmDevice,
     resource: impl ResourceHandle,
     name: &str,
-) -> Option<(property::Handle, property::RawValue)> {
+) -> Option<(property::Handle, property::Info, property::RawValue)> {
     let props = match drm.get_properties(resource) {
         Ok(props) => props,
         Err(err) => {
@@ -1869,7 +1981,7 @@ fn find_drm_property(
         let info = drm.get_property(handle).ok()?;
         let n = info.name().to_str().ok()?;
 
-        (n == name).then_some((handle, value))
+        (n == name).then_some((handle, info, value))
     })
 }
 
@@ -1892,7 +2004,7 @@ fn get_drm_property(
 }
 
 fn set_crtc_active(drm: &DrmDevice, crtc: crtc::Handle, active: bool) {
-    let Some((prop, _)) = find_drm_property(drm, crtc, "ACTIVE") else {
+    let Some((prop, _, _)) = find_drm_property(drm, crtc, "ACTIVE") else {
         return;
     };
 
@@ -2106,6 +2218,29 @@ fn set_max_bpc(device: &DrmDevice, connector: connector::Handle, bpc: u64) -> an
     }
 
     Err(anyhow!("couldn't find max bpc property"))
+}
+
+fn is_vrr_capable(device: &DrmDevice, connector: connector::Handle) -> Option<bool> {
+    let (_, info, value) = find_drm_property(device, connector, "vrr_capable")?;
+    info.value_type().convert_value(value).as_boolean()
+}
+
+fn set_vrr_enabled(device: &DrmDevice, crtc: crtc::Handle, enabled: bool) -> anyhow::Result<bool> {
+    let (prop, info, _) =
+        find_drm_property(device, crtc, "VRR_ENABLED").context("VRR_ENABLED property missing")?;
+
+    let value = property::Value::UnsignedRange(if enabled { 1 } else { 0 });
+    device
+        .set_property(crtc, prop, value.into())
+        .context("error setting VRR_ENABLED property")?;
+
+    let value = get_drm_property(device, crtc, prop)
+        .context("VRR_ENABLED property missing after setting")?;
+    match info.value_type().convert_value(value) {
+        property::Value::UnsignedRange(value) => Ok(value == 1),
+        property::Value::Boolean(value) => Ok(value),
+        _ => bail!("wrong VRR_ENABLED property type"),
+    }
 }
 
 pub fn set_gamma_for_crtc(

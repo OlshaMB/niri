@@ -45,6 +45,20 @@ window-rule {
     block-out-from "screencast"
     // block-out-from "screen-capture"
 
+    focus-ring {
+        // off
+        on
+        width 4
+        active-color "#7fc8ff"
+        inactive-color "#505050"
+        // active-gradient from="#80c8ff" to="#bbddff" angle=45
+        // inactive-gradient from="#505050" to="#808080" angle=45 relative-to="workspace-view"
+    }
+
+    border {
+        // Same as focus-ring.
+    }
+
     min-width 100
     max-width 200
     min-height 300
@@ -334,6 +348,33 @@ This property can be useful for rectangular windows that do not support the xdg-
 ```
 window-rule {
     draw-border-with-background false
+}
+```
+
+#### `focus-ring` and `border`
+
+<sup>Since: 0.1.6</sup>
+
+Override the focus ring and border options for the window.
+
+These rules have the same options as the normal focus ring and border config in the [layout](./Configuration:-Layout.md) section, so check the documentation there.
+
+However, in addition to `off` to disable the border/focus ring, this window rule has an `on` flag that enables the border/focus ring for the window even if it was otherwise disabled.
+The `on` flag has precedence over the `off` flag, in case both are set.
+
+```
+window-rule {
+    focus-ring {
+        off
+        width 2
+    }
+}
+
+window-rule {
+    border {
+        on
+        width 8
+    }
 }
 ```
 

@@ -1,5 +1,5 @@
 use smithay::desktop::{
-    find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output, LayerSurface,
+    find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output, utils, LayerSurface,
     PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy, Window,
     WindowSurfaceType,
 };
@@ -18,7 +18,7 @@ use smithay::wayland::compositor::{
 };
 use smithay::wayland::input_method::InputMethodSeat;
 use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
-use smithay::wayland::shell::wlr_layer::Layer;
+use smithay::wayland::shell::wlr_layer::{self, Layer};
 use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgPopupSurfaceData, XdgShellHandler,
@@ -47,9 +47,10 @@ impl XdgShellHandler for State {
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
-        self.unconstrain_popup(&surface);
+        let popup = PopupKind::Xdg(surface);
+        self.unconstrain_popup(&popup);
 
-        if let Err(err) = self.niri.popups.track_popup(PopupKind::Xdg(surface)) {
+        if let Err(err) = self.niri.popups.track_popup(popup) {
             warn!("error tracking popup: {err:?}");
         }
     }
@@ -79,7 +80,7 @@ impl XdgShellHandler for State {
             state.geometry = geometry;
             state.positioner = positioner;
         });
-        self.unconstrain_popup(&surface);
+        self.unconstrain_popup(&PopupKind::Xdg(surface.clone()));
         surface.send_repositioned(token);
     }
 
@@ -120,19 +121,20 @@ impl XdgShellHandler for State {
                     return;
                 }
             } else {
-                if layers
-                    .layers_on(Layer::Overlay)
-                    .any(|l| l.can_receive_keyboard_focus())
-                {
+                if layers.layers_on(Layer::Overlay).any(|l| {
+                    l.cached_state().keyboard_interactivity
+                        == wlr_layer::KeyboardInteractivity::Exclusive
+                }) {
                     let _ = PopupManager::dismiss_popup(&root, &popup);
                     return;
                 }
 
                 let mon = self.niri.layout.monitor_for_output(output).unwrap();
                 if !mon.render_above_top_layer()
-                    && layers
-                        .layers_on(Layer::Top)
-                        .any(|l| l.can_receive_keyboard_focus())
+                    && layers.layers_on(Layer::Top).any(|l| {
+                        l.cached_state().keyboard_interactivity
+                            == wlr_layer::KeyboardInteractivity::Exclusive
+                    })
                 {
                     let _ = PopupManager::dismiss_popup(&root, &popup);
                     return;
@@ -176,7 +178,7 @@ impl XdgShellHandler for State {
 
         trace!("new grab for root {:?}", root);
         keyboard.set_focus(self, grab.current_grab(), serial);
-        keyboard.set_grab(PopupKeyboardGrab::new(&grab), serial);
+        keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
         pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
         self.niri.popup_grab = Some(PopupGrabState { root, grab });
     }
@@ -229,7 +231,7 @@ impl XdgShellHandler for State {
 
                     // The required configure will be the initial configure.
                 }
-                InitialConfigureState::Configured { output, .. } => {
+                InitialConfigureState::Configured { rules, output, .. } => {
                     // Figure out the monitor following a similar logic to initial configure.
                     // FIXME: deduplicate.
                     let mon = requested_output
@@ -268,7 +270,7 @@ impl XdgShellHandler for State {
                         toplevel.with_pending_state(|state| {
                             state.states.set(xdg_toplevel::State::Fullscreen);
                         });
-                        ws.configure_new_window(&unmapped.window, None);
+                        ws.configure_new_window(&unmapped.window, None, rules);
                     }
 
                     // We already sent the initial configure, so we need to reconfigure.
@@ -301,10 +303,10 @@ impl XdgShellHandler for State {
                     // The required configure will be the initial configure.
                 }
                 InitialConfigureState::Configured {
+                    rules,
                     width,
                     is_full_width,
                     output,
-                    ..
                 } => {
                     // Figure out the monitor following a similar logic to initial configure.
                     // FIXME: deduplicate.
@@ -348,7 +350,7 @@ impl XdgShellHandler for State {
                         } else {
                             *width
                         };
-                        ws.configure_new_window(&unmapped.window, configure_width);
+                        ws.configure_new_window(&unmapped.window, configure_width, rules);
                     }
 
                     // We already sent the initial configure, so we need to reconfigure.
@@ -387,7 +389,7 @@ impl XdgShellHandler for State {
         let output = output.clone();
 
         self.backend.with_primary_renderer(|renderer| {
-            mapped.render_and_store_snapshot(renderer);
+            mapped.store_unmap_snapshot_if_empty(renderer);
         });
         self.backend.with_primary_renderer(|renderer| {
             self.niri
@@ -579,7 +581,7 @@ impl State {
             } else {
                 width
             };
-            ws.configure_new_window(window, configure_width);
+            ws.configure_new_window(window, configure_width, &rules);
         }
 
         // If the user prefers no CSD, it's a reasonable assumption that they would prefer to get
@@ -648,8 +650,11 @@ impl State {
                         popup.send_configure().expect("initial configure failed");
                     }
                 }
-                // Input method popups don't require a configure.
-                PopupKind::InputMethod(_) => (),
+                // Input method popup can arbitrary change its geometry, so we need to unconstrain
+                // it on commit.
+                PopupKind::InputMethod(_) => {
+                    self.unconstrain_popup(&popup);
+                }
             }
         }
     }
@@ -659,12 +664,12 @@ impl State {
         self.niri.output_for_root(&root)
     }
 
-    pub fn unconstrain_popup(&self, popup: &PopupSurface) {
+    pub fn unconstrain_popup(&self, popup: &PopupKind) {
         let _span = tracy_client::span!("Niri::unconstrain_popup");
 
         // Popups with a NULL parent will get repositioned in their respective protocol handlers
         // (i.e. layer-shell).
-        let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
+        let Ok(root) = find_popup_root_surface(popup) else {
             return;
         };
 
@@ -680,7 +685,7 @@ impl State {
         }
     }
 
-    fn unconstrain_window_popup(&self, popup: &PopupSurface, window: &Window, output: &Output) {
+    fn unconstrain_window_popup(&self, popup: &PopupKind, window: &Window, output: &Output) {
         let window_geo = window.geometry();
         let output_geo = self.niri.global_space.output_geometry(output).unwrap();
 
@@ -693,16 +698,14 @@ impl State {
         let mut target =
             Rectangle::from_loc_and_size((0, 0), (window_geo.size.w, output_geo.size.h));
         target.loc.y -= self.niri.layout.window_y(window).unwrap();
-        target.loc -= get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
+        target.loc -= get_popup_toplevel_coords(popup);
 
-        popup.with_pending_state(|state| {
-            state.geometry = unconstrain_with_padding(state.positioner, target);
-        });
+        self.position_popup_within_rect(popup, target);
     }
 
     pub fn unconstrain_layer_shell_popup(
         &self,
-        popup: &PopupSurface,
+        popup: &PopupKind,
         layer_surface: &LayerSurface,
         output: &Output,
     ) {
@@ -716,11 +719,46 @@ impl State {
         // we will compute that here.
         let mut target = Rectangle::from_loc_and_size((0, 0), output_geo.size);
         target.loc -= layer_geo.loc;
-        target.loc -= get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
+        target.loc -= get_popup_toplevel_coords(popup);
 
-        popup.with_pending_state(|state| {
-            state.geometry = unconstrain_with_padding(state.positioner, target);
-        });
+        self.position_popup_within_rect(popup, target);
+    }
+
+    fn position_popup_within_rect(&self, popup: &PopupKind, target: Rectangle<i32, Logical>) {
+        match popup {
+            PopupKind::Xdg(popup) => {
+                popup.with_pending_state(|state| {
+                    state.geometry = unconstrain_with_padding(state.positioner, target);
+                });
+            }
+            PopupKind::InputMethod(popup) => {
+                let text_input_rectangle = popup.text_input_rectangle();
+                let mut bbox =
+                    utils::bbox_from_surface_tree(popup.wl_surface(), text_input_rectangle.loc);
+
+                // Position bbox horizontally first.
+                let overflow_x = (bbox.loc.x + bbox.size.w) - (target.loc.x + target.size.w);
+                if overflow_x > 0 {
+                    bbox.loc.x -= overflow_x;
+                }
+
+                // Ensure that the popup starts within the window.
+                bbox.loc.x = bbox.loc.x.max(target.loc.x);
+
+                // Try to position IME popup below the text input rectangle.
+                let mut below = bbox;
+                below.loc.y += text_input_rectangle.size.h;
+
+                let mut above = bbox;
+                above.loc.y -= bbox.size.h;
+
+                if target.loc.y + target.size.h >= below.loc.y + below.size.h {
+                    popup.set_location(below.loc);
+                } else {
+                    popup.set_location(above.loc);
+                }
+            }
+        }
     }
 
     pub fn update_reactive_popups(&self, window: &Window, output: &Output) {
@@ -729,10 +767,10 @@ impl State {
         for (popup, _) in PopupManager::popups_for_surface(
             window.toplevel().expect("no x11 support").wl_surface(),
         ) {
-            match popup {
-                PopupKind::Xdg(ref popup) => {
+            match &popup {
+                xdg_popup @ PopupKind::Xdg(popup) => {
                     if popup.with_pending_state(|state| state.positioner.reactive) {
-                        self.unconstrain_window_popup(popup, window, output);
+                        self.unconstrain_window_popup(xdg_popup, window, output);
                         if let Err(err) = popup.send_pending_configure() {
                             warn!("error re-configuring reactive popup: {err:?}");
                         }
@@ -845,11 +883,11 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
 
         if got_unmapped {
             state.backend.with_primary_renderer(|renderer| {
-                mapped.render_and_store_snapshot(renderer);
+                mapped.store_unmap_snapshot_if_empty(renderer);
             });
         } else {
-            // The toplevel remains mapped; clear any cached render snapshot.
-            let _ = mapped.take_last_render();
+            // The toplevel remains mapped; clear any stored unmap snapshot.
+            let _ = mapped.take_unmap_snapshot();
 
             if animate {
                 state.backend.with_primary_renderer(|renderer| {

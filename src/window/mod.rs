@@ -1,4 +1,4 @@
-use niri_config::{BlockOutFrom, Match, WindowRule};
+use niri_config::{BlockOutFrom, BorderRule, Match, WindowRule};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::xdg::{
@@ -48,6 +48,11 @@ pub struct ResolvedWindowRules {
     /// Extra bound on the maximum window height.
     pub max_height: Option<u16>,
 
+    /// Focus ring overrides.
+    pub focus_ring: BorderRule,
+    /// Window border overrides.
+    pub border: BorderRule,
+
     /// Whether or not to draw the border with a solid background.
     ///
     /// `None` means using the SSD heuristic.
@@ -87,6 +92,24 @@ impl ResolvedWindowRules {
             min_height: None,
             max_width: None,
             max_height: None,
+            focus_ring: BorderRule {
+                off: false,
+                on: false,
+                width: None,
+                active_color: None,
+                inactive_color: None,
+                active_gradient: None,
+                inactive_gradient: None,
+            },
+            border: BorderRule {
+                off: false,
+                on: false,
+                width: None,
+                active_color: None,
+                inactive_color: None,
+                active_gradient: None,
+                inactive_gradient: None,
+            },
             draw_border_with_background: None,
             opacity: None,
             block_out_from: None,
@@ -157,6 +180,9 @@ impl ResolvedWindowRules {
                 if let Some(x) = rule.max_height {
                     resolved.max_height = Some(x);
                 }
+
+                resolved.focus_ring.merge_with(&rule.focus_ring);
+                resolved.border.merge_with(&rule.border);
 
                 if let Some(x) = rule.draw_border_with_background {
                     resolved.draw_border_with_background = Some(x);
